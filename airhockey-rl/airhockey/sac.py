@@ -135,7 +135,9 @@ class SACConfig:
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 1e-4
-    init_log_alpha: float = -1.0
+    init_log_alpha: float = -2.3  # alpha ~= 0.1
+    # Hard floor so auto-tuning can never collapse entropy. log(0.05) ~= -3.0.
+    min_log_alpha: float = -3.0
     # Defaults to -0.5 * act_dim (half the pre-squash target), which
     # keeps the tanh-squashed Gaussian off the saturation walls.
     target_entropy: float | None = None
@@ -215,6 +217,9 @@ class SACAgent:
         self.opt_alpha.zero_grad(set_to_none=True)
         loss_alpha.backward()
         self.opt_alpha.step()
+        # Clamp log_alpha to its floor so entropy can't collapse to zero.
+        with torch.no_grad():
+            self.log_alpha.clamp_(min=self.cfg.min_log_alpha)
 
         # ── Polyak target update ─────────────────────────────
         with torch.no_grad():
