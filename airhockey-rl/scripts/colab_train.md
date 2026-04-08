@@ -18,8 +18,8 @@ of T4 time per session so it fits in one sitting.
 ## Cell 1 — Clone and install
 
 ```python
-!git clone https://github.com/akshan-main/airhockey-rl.git
-%cd airhockey-rl
+!git clone https://github.com/akshan-main/airhockey-rl-sac-dppo.git
+%cd airhockey-rl-sac-dppo/airhockey-rl
 !pip install -q -e ".[storage,app,hub]"
 !pip install -q torch  # Colab usually has torch already
 import torch
