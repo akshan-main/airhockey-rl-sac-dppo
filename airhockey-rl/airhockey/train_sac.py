@@ -32,15 +32,21 @@ import torch
 from tqdm import tqdm
 
 from airhockey.env import AirHockeyEnv
-from airhockey.eval_sac import run_eval, scripted_tracker, with_action_noise
+from airhockey.eval_sac import (
+    run_eval,
+    scripted_attacker,
+    scripted_tracker,
+    with_action_noise,
+)
 from airhockey.physics import PhysicsConfig
 from airhockey.sac import ReplayBuffer, SACAgent, SACConfig
 
 
 # ── Opponent mix (must sum to 1.0) ─────────────────────────────
-LEAGUE_SCRIPTED_PROB = 0.40
-LEAGUE_STATIONARY_PROB = 0.30
-LEAGUE_SNAPSHOT_PROB = 0.30
+LEAGUE_TRACKER_PROB = 0.30      # passive defender
+LEAGUE_ATTACKER_PROB = 0.30     # active scorer — generates pressure
+LEAGUE_STATIONARY_PROB = 0.15
+LEAGUE_SNAPSHOT_PROB = 0.25
 
 # Noise on the scripted opponent (training league + eval) so the agent
 # can't memorize a fixed action sequence.
@@ -105,16 +111,19 @@ def main(args: TrainArgs) -> None:
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    # Noisy scripted opponent — used both as the warmup opponent and as
-    # the scripted slot in the league. The noise prevents memorization.
-    noisy_scripted = with_action_noise(
+    # Noisy scripted opponents — used in the league. Noise prevents the
+    # agent from memorizing a fixed action sequence.
+    noisy_tracker = with_action_noise(
         scripted_tracker, SCRIPTED_NOISE_STD, seed=args.seed + 101,
     )
+    noisy_attacker = with_action_noise(
+        scripted_attacker, SCRIPTED_NOISE_STD, seed=args.seed + 202,
+    )
 
-    # Training env. Opponent starts as the scripted tracker so the agent
-    # has a moving opponent from step 0; swapped to the league after warmup.
+    # Training env. Warmup opponent is the attacker so goal events fire
+    # quickly under the pure-sparse reward; swapped to the league after.
     env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=args.seed,
-                       opponent=noisy_scripted)
+                       opponent=noisy_attacker)
 
     cfg = SACConfig(obs_dim=env.observation_space.shape[0],
                     act_dim=env.action_space.shape[0])
@@ -136,13 +145,15 @@ def main(args: TrainArgs) -> None:
         r = league_rng.random()
         if r < LEAGUE_STATIONARY_PROB:
             return _stationary_opponent(obs_top)
-        if r < LEAGUE_STATIONARY_PROB + LEAGUE_SCRIPTED_PROB:
-            return noisy_scripted(obs_top)
+        if r < LEAGUE_STATIONARY_PROB + LEAGUE_TRACKER_PROB:
+            return noisy_tracker(obs_top)
+        if r < LEAGUE_STATIONARY_PROB + LEAGUE_TRACKER_PROB + LEAGUE_ATTACKER_PROB:
+            return noisy_attacker(obs_top)
         if opponent_league:
             snapshot = league_rng.choice(list(opponent_league))
             return _sampled_policy_fn(snapshot)(obs_top)
         # Fallback before any snapshot exists.
-        return noisy_scripted(obs_top)
+        return noisy_attacker(obs_top)
 
     def add_snapshot_to_league() -> None:
         snap = copy.deepcopy(agent.actor).eval()
@@ -195,6 +206,10 @@ def main(args: TrainArgs) -> None:
             agent, scripted_tracker, episodes=args.eval_episodes,
             seed=10_000 + step, opponent_noise_std=SCRIPTED_NOISE_STD,
         )
+        metrics_attacker = run_eval(
+            agent, scripted_attacker, episodes=args.eval_episodes,
+            seed=15_000 + step, opponent_noise_std=SCRIPTED_NOISE_STD,
+        )
         metrics_none = run_eval(
             agent, None, episodes=args.eval_episodes,
             seed=20_000 + step,
@@ -204,7 +219,12 @@ def main(args: TrainArgs) -> None:
         # but be explicit so future refactors don't silently break.
         agent.actor.train()
 
-        for name, m in (("scripted", metrics_scripted), ("none", metrics_none)):
+        named = (
+            ("scripted", metrics_scripted),
+            ("attacker", metrics_attacker),
+            ("none", metrics_none),
+        )
+        for name, m in named:
             eval_writer.writerow([
                 step, name,
                 f"{m['win_rate']:.4f}",
@@ -216,9 +236,15 @@ def main(args: TrainArgs) -> None:
             ])
         eval_csv.flush()
 
-        score = 0.5 * (metrics_scripted["win_rate"] + metrics_none["win_rate"])
+        # Selection score: average win rate across all three opponents.
+        score = (
+            metrics_scripted["win_rate"]
+            + metrics_attacker["win_rate"]
+            + metrics_none["win_rate"]
+        ) / 3.0
         tqdm.write(
             f"[step {step}] eval  scripted {metrics_scripted['win_rate']:.1%}"
+            f" / attacker {metrics_attacker['win_rate']:.1%}"
             f" / none {metrics_none['win_rate']:.1%}  (score {score:.3f})"
         )
         if score > best_score:

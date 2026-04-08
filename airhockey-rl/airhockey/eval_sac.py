@@ -51,6 +51,56 @@ def scripted_tracker(obs: np.ndarray) -> np.ndarray:
     return np.array([ax, ay], dtype=np.float32)
 
 
+def scripted_attacker(obs: np.ndarray) -> np.ndarray:
+    """Active opponent. Defends home when the puck is on the agent's
+    side; charges and strikes when the puck is on its own side. Aims
+    its strikes at the opponent goal, not at the agent's paddle.
+
+    Receives obs in this paddle's mirrored perspective (sees itself as
+    the bottom paddle), so larger y is its own goal, smaller y is the
+    opponent's. Layout matches physics.get_obs (perspective='top'):
+      [0] puck_x  [1] puck_y  [2] puck_vx  [3] puck_vy
+      [4] own_x   [5] own_y   [6] own_vx   [7] own_vy
+      [8] other_x [9] other_y
+    All positions normalized to [0, 1].
+
+    Behavior:
+      - puck on attacker's side (y > 0.5): chase the puck, but lead it
+        slightly so the contact velocity points at the opponent goal
+        center (x = 0.5, y = 0.0 in attacker frame).
+      - puck on agent's side (y < 0.5): retreat to home y, slide x to
+        track the puck so a return shot has somewhere to go.
+    """
+    puck_x, puck_y = float(obs[0]), float(obs[1])
+    pad_x, pad_y = float(obs[4]), float(obs[5])
+
+    if puck_y > 0.5:
+        # Attack mode: aim a hit such that the contact pushes the puck
+        # toward the opponent goal at (0.5, 0.0). Approach from the
+        # side opposite the goal so the contact normal points goal-ward.
+        goal_x, goal_y = 0.5, 0.0
+        dx_to_goal = goal_x - puck_x
+        dy_to_goal = goal_y - puck_y
+        norm = (dx_to_goal * dx_to_goal + dy_to_goal * dy_to_goal) ** 0.5
+        if norm < 1e-6:
+            approach_x, approach_y = puck_x, puck_y
+        else:
+            # Approach point is on the far side of the puck from the goal.
+            offset = 0.06
+            approach_x = puck_x - (dx_to_goal / norm) * offset
+            approach_y = puck_y - (dy_to_goal / norm) * offset
+        ax = float(np.clip((approach_x - pad_x) * 10.0, -1.0, 1.0))
+        ay = float(np.clip((approach_y - pad_y) * 10.0, -1.0, 1.0))
+    else:
+        # Defend: home y near the back wall, x tracks the puck.
+        target_x = puck_x
+        target_y = 0.85
+        ax = float(np.clip((target_x - pad_x) * 8.0, -1.0, 1.0))
+        ay = float(np.clip((target_y - pad_y) * 8.0, -1.0, 1.0))
+
+    return np.array([ax, ay], dtype=np.float32)
+
+
 def with_action_noise(fn, std: float, seed: int = 0):
     """Wrap an opponent_fn so its actions get isotropic Gaussian noise.
 
