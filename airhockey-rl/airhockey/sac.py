@@ -21,8 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-LOG_STD_MIN = -5.0
-LOG_STD_MAX = 2.0
+LOG_STD_MIN = -2.0
+LOG_STD_MAX = 1.0
 
 
 # ── Actor and Critic networks ─────────────────────────────────
@@ -131,12 +131,14 @@ class SACConfig:
     act_dim: int = 2
     hidden: int = 256
     gamma: float = 0.99
-    tau: float = 0.005               # Polyak averaging rate
+    tau: float = 0.005
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
-    alpha_lr: float = 3e-4
-    init_log_alpha: float = 0.0
-    target_entropy: float | None = None  # defaults to -act_dim
+    alpha_lr: float = 1e-4
+    init_log_alpha: float = -1.0
+    # Defaults to -0.5 * act_dim (half the pre-squash target), which
+    # keeps the tanh-squashed Gaussian off the saturation walls.
+    target_entropy: float | None = None
 
 
 class SACAgent:
@@ -157,7 +159,7 @@ class SACAgent:
             cfg.init_log_alpha, device=self.device, requires_grad=True
         )
         self.target_entropy = (
-            -float(cfg.act_dim) if cfg.target_entropy is None else cfg.target_entropy
+            -0.5 * float(cfg.act_dim) if cfg.target_entropy is None else cfg.target_entropy
         )
 
         self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)

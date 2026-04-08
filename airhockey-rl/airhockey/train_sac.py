@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import random
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -18,6 +20,7 @@ import torch
 from tqdm import tqdm
 
 from airhockey.env import AirHockeyEnv
+from airhockey.eval_sac import scripted_tracker
 from airhockey.physics import PhysicsConfig
 from airhockey.sac import ReplayBuffer, SACAgent, SACConfig
 
@@ -32,7 +35,8 @@ class TrainArgs:
     update_every: int = 1
     updates_per_step: int = 1
     opponent_warmup_steps: int = 50_000
-    opponent_refresh_steps: int = 50_000
+    opponent_refresh_steps: int = 25_000
+    opponent_league_size: int = 5
     eval_every_steps: int = 50_000
     eval_episodes: int = 20
     log_every_steps: int = 1_000
@@ -45,29 +49,43 @@ def main(args: TrainArgs) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=args.seed, opponent=None)
+    # Start against the scripted tracker so the agent has a moving
+    # opponent to learn against from step 0. After warmup, switch to a
+    # self-play league (frozen snapshots of the agent itself).
+    env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=args.seed,
+                       opponent=scripted_tracker)
 
     cfg = SACConfig(obs_dim=env.observation_space.shape[0],
                     act_dim=env.action_space.shape[0])
     agent = SACAgent(cfg, device=device)
     buffer = ReplayBuffer(args.buffer_size, cfg.obs_dim, cfg.act_dim)
 
-    frozen_actor: Optional[torch.nn.Module] = None
+    # Opponent league: a mix of recent actor snapshots plus the scripted
+    # tracker baseline. Each episode picks one uniformly at random.
+    opponent_league: deque = deque(maxlen=args.opponent_league_size)
+    league_rng = random.Random(args.seed + 17)
 
-    def frozen_opponent_fn(obs_top: np.ndarray) -> np.ndarray:
-        if frozen_actor is None:
-            return np.zeros(cfg.act_dim, dtype=np.float32)
-        with torch.no_grad():
-            obs_t = torch.from_numpy(obs_top.astype(np.float32)).unsqueeze(0).to(device)
-            action = frozen_actor.act_deterministic(obs_t)
-        return action.squeeze(0).cpu().numpy()
+    def _sampled_policy_fn(snapshot):
+        def fn(obs_top: np.ndarray) -> np.ndarray:
+            with torch.no_grad():
+                obs_t = torch.from_numpy(obs_top.astype(np.float32)).unsqueeze(0).to(device)
+                action, _ = snapshot.sample(obs_t)
+            return action.squeeze(0).cpu().numpy()
+        return fn
 
-    def refresh_frozen_opponent() -> None:
-        nonlocal frozen_actor
-        frozen_actor = copy.deepcopy(agent.actor).eval()
-        for p in frozen_actor.parameters():
+    def league_opponent_fn(obs_top: np.ndarray) -> np.ndarray:
+        # 30% scripted, 70% a random policy snapshot (if any exist).
+        if opponent_league and league_rng.random() < 0.7:
+            snapshot = league_rng.choice(list(opponent_league))
+            return _sampled_policy_fn(snapshot)(obs_top)
+        return scripted_tracker(obs_top)
+
+    def add_snapshot_to_league() -> None:
+        snap = copy.deepcopy(agent.actor).eval()
+        for p in snap.parameters():
             p.requires_grad = False
-        env.opponent = frozen_opponent_fn
+        opponent_league.append(snap)
+        env.opponent = league_opponent_fn
 
     obs, _ = env.reset(seed=args.seed)
     ep_return = 0.0
@@ -105,14 +123,14 @@ def main(args: TrainArgs) -> None:
                 latest_metrics = agent.update(batch)
 
         if step == args.opponent_warmup_steps:
-            refresh_frozen_opponent()
-            tqdm.write(f"[step {step}] switched to self-play opponent")
+            add_snapshot_to_league()
+            tqdm.write(f"[step {step}] switched to self-play league")
         elif (
-            frozen_actor is not None
+            len(opponent_league) > 0
             and step > args.opponent_warmup_steps
             and step % args.opponent_refresh_steps == 0
         ):
-            refresh_frozen_opponent()
+            add_snapshot_to_league()
 
         if (step + 1) % args.log_every_steps == 0 and ep_returns:
             avg_ret = float(np.mean(ep_returns[-20:]))

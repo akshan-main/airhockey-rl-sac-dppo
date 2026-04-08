@@ -84,15 +84,21 @@ class AirHockeyPhysics:
     def reset(self, serve_to: Literal["top", "bot"] = "top") -> None:
         c = self.cfg
         s = self.state
-        s.puck_x = c.width / 2
-        s.puck_y = c.height * (0.28 if serve_to == "top" else 0.72)
+        # Puck serves with a random x-offset so the agent can't exploit a
+        # fixed starting trajectory.
+        x_jitter = float(self.rng.uniform(-40.0, 40.0))
+        s.puck_x = c.width / 2 + x_jitter
+        s.puck_y = c.height * (0.30 if serve_to == "top" else 0.70)
         s.puck_vx = 0.0
         s.puck_vy = 0.0
+        # Paddles reset to their home positions. The top paddle home is
+        # well clear of the puck's serve trajectory so a straight shot
+        # from the bot can't trivially bounce off a stationary top.
         s.top_x = c.width / 2
-        s.top_y = c.wall + c.paddle_radius + 60
+        s.top_y = c.wall + c.paddle_radius + 30
         s.top_vx = s.top_vy = 0.0
         s.bot_x = c.width / 2
-        s.bot_y = c.height - c.wall - c.paddle_radius - 60
+        s.bot_y = c.height - c.wall - c.paddle_radius - 30
         s.bot_vx = s.bot_vy = 0.0
         s.last_event = ""
 

@@ -31,9 +31,12 @@ class AirHockeyEnv(gym.Env):
         opponent: Optional[OpponentFn] = None,
         reward_score: float = 10.0,
         reward_concede: float = -10.0,
-        reward_hit: float = 0.1,
-        reward_shaping_coef: float = 0.01,
-        max_episode_steps: int = 1500,
+        reward_hit: float = 0.3,
+        reward_vel_coef: float = 0.02,
+        reward_puck_side_coef: float = 0.005,
+        reward_approach_coef: float = 0.5,
+        reward_time_coef: float = 0.001,
+        max_episode_steps: int = 800,
         seed: int = 0,
     ):
         super().__init__()
@@ -42,9 +45,13 @@ class AirHockeyEnv(gym.Env):
         self.reward_score = reward_score
         self.reward_concede = reward_concede
         self.reward_hit = reward_hit
-        self.reward_shaping_coef = reward_shaping_coef
+        self.reward_vel_coef = reward_vel_coef
+        self.reward_puck_side_coef = reward_puck_side_coef
+        self.reward_approach_coef = reward_approach_coef
+        self.reward_time_coef = reward_time_coef
         self.max_episode_steps = max_episode_steps
         self._step_count = 0
+        self._prev_dist = None  # bot-paddle <-> puck distance at previous step
 
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(10,), dtype=np.float32
@@ -68,10 +75,32 @@ class AirHockeyEnv(gym.Env):
         a[1] = -a[1]
         return a * self.physics.cfg.max_paddle_accel
 
+    def _puck_distance(self) -> float:
+        s = self.physics.state
+        return float(np.hypot(s.puck_x - s.bot_x, s.puck_y - s.bot_y))
+
     def _shaping_reward(self) -> float:
-        # Positive when puck moves toward the opponent goal (negative vy).
-        v_norm = -self.physics.state.puck_vy / self.physics.cfg.max_puck_speed
-        return self.reward_shaping_coef * v_norm
+        s = self.physics.state
+        c = self.physics.cfg
+        # Puck velocity toward opponent goal (up = negative vy).
+        v_norm = -s.puck_vy / c.max_puck_speed
+        # Puck position bias: +1 at opponent wall, -1 at our wall.
+        side = 1.0 - 2.0 * (s.puck_y / c.height)
+        # Approach: reward the bot paddle for reducing its distance to
+        # the puck. This gives a gradient even when the puck is at rest.
+        cur_dist = self._puck_distance()
+        if self._prev_dist is None:
+            approach = 0.0
+        else:
+            delta = self._prev_dist - cur_dist  # positive when approaching
+            approach = delta / c.max_paddle_speed
+        self._prev_dist = cur_dist
+        return (
+            self.reward_vel_coef * v_norm
+            + self.reward_puck_side_coef * side
+            + self.reward_approach_coef * approach
+            - self.reward_time_coef
+        )
 
     def reset(
         self,
@@ -82,8 +111,12 @@ class AirHockeyEnv(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self.physics.rng = np.random.default_rng(seed)
-        self.physics.hard_reset(serve_to="bot")
+        # Randomize which side serves so the agent can't condition on
+        # "always get first strike".
+        serve = "bot" if self.physics.rng.random() < 0.5 else "top"
+        self.physics.hard_reset(serve_to=serve)
         self._step_count = 0
+        self._prev_dist = None
         obs = self.physics.get_obs(perspective="bot")
         return obs, {}
 
