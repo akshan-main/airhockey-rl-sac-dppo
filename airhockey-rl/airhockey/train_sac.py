@@ -39,8 +39,8 @@ from airhockey.sac import ReplayBuffer, SACAgent, SACConfig
 
 # ── Opponent mix (must sum to 1.0) ─────────────────────────────
 LEAGUE_SCRIPTED_PROB = 0.40
-LEAGUE_STATIONARY_PROB = 0.15
-LEAGUE_SNAPSHOT_PROB = 0.45
+LEAGUE_STATIONARY_PROB = 0.30
+LEAGUE_SNAPSHOT_PROB = 0.30
 
 # Noise on the scripted opponent (training league + eval) so the agent
 # can't memorize a fixed action sequence.

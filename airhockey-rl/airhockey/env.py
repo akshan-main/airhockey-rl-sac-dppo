@@ -48,7 +48,7 @@ class AirHockeyEnv(gym.Env):
         reward_concede: float = -10.0,
         reward_strike_coef: float = 0.5,
         reward_approach_coef: float = 0.05,
-        reward_home_coef: float = 0.005,
+        reward_home_coef: float = 0.002,
         reward_time_coef: float = 0.001,
         reward_jerk_coef: float = 0.02,
         max_episode_steps: int = 800,
@@ -169,14 +169,27 @@ class AirHockeyEnv(gym.Env):
             reward += self.reward_concede
             terminated = True
         elif event == "hit_bot":
-            # Strike bonus: outgoing puck speed toward the opponent goal
-            # (negative vy is up, toward y=0). A hard shot is rewarded
-            # much more than a tap, so the agent has a reason to wind up.
-            outgoing = max(
-                0.0,
-                -self.physics.state.puck_vy / self.physics.cfg.max_puck_speed,
-            )
-            reward += self.reward_strike_coef * outgoing
+            # Strike bonus: outgoing puck speed * shot quality. The
+            # quality term measures how well the shot clears the
+            # opponent paddle, so a hard shot fired straight at the
+            # opponent gets ~0 reward and a hard shot angled around
+            # them gets up to ~1. Without this multiplier the agent
+            # has no aiming gradient and learns to fire at the center
+            # — which is exactly where a stationary opponent sits.
+            ps = self.physics.state
+            pc = self.physics.cfg
+            outgoing = max(0.0, -ps.puck_vy / pc.max_puck_speed)
+            quality = 0.0
+            if outgoing > 0.0 and ps.puck_vy < -1e-3:
+                # Linear forward-extrapolation to the opponent's y. Time
+                # of flight to the top paddle's current y line.
+                tof = max(0.0, (ps.puck_y - ps.top_y) / (-ps.puck_vy))
+                pred_x = ps.puck_x + ps.puck_vx * tof
+                clearance = abs(pred_x - ps.top_x)
+                # Normalize: 0 at the paddle's center, 1.0 once the
+                # predicted miss is >= 2 paddle radii.
+                quality = min(1.0, clearance / (2.0 * pc.paddle_radius))
+            reward += self.reward_strike_coef * outgoing * quality
 
         reward += self._shaping_reward()
 
