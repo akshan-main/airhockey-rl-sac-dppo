@@ -213,8 +213,12 @@ def main(args: TrainArgs) -> None:
         return noisy_attacker(obs_top)
 
     # Training env uses the curriculum-aware league callable from step 0.
+    # Strike-shaping bonus is enabled during Phase 1 (pure aiming
+    # practice) and turned off when Phase 2 begins, so the policy is
+    # then refined under pure sparse reward for the rest of training.
     env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=args.seed,
                        opponent=league_opponent_fn)
+    env.shaping_enabled = True
     cfg = SACConfig(obs_dim=env.observation_space.shape[0],
                     act_dim=env.action_space.shape[0])
     agent = SACAgent(cfg, device=device)
@@ -363,10 +367,11 @@ def main(args: TrainArgs) -> None:
         # Snapshots start being added once Phase 1 (pure aiming) ends.
         if step == args.curriculum_warmup_steps:
             add_snapshot_to_league()
+            env.shaping_enabled = False
             tqdm.write(
                 f"[step {step}] curriculum: phase 1 complete, "
-                f"snapshots enabled, blending to steady-state mix by "
-                f"step {args.curriculum_blend_end}"
+                f"strike shaping off, snapshots enabled, blending to "
+                f"steady-state mix by step {args.curriculum_blend_end}"
             )
         elif (
             len(opponent_league) > 0

@@ -4,11 +4,13 @@ is driven by `self.opponent`, a callable obs_top -> action in [-1, 1].
 Observation: (10,) float32 — see physics.get_obs.
 Action: (2,) float32 in [-1, 1], scaled to physics.max_paddle_accel.
 
-Reward: pure sparse. +10 on scoring, -10 on conceding, 0 otherwise.
-The agent has to learn that hitting the puck eventually leads to a goal.
-This works only if the opponent generates enough offensive pressure that
-the sparse signal fires often enough — see scripted_attacker in
-eval_sac.py.
+Reward — pure sparse by default (+10 on scoring, -10 on conceding,
+0 otherwise). Optionally a small strike-shaping bonus on bot/puck
+contact, gated by `shaping_enabled` so the trainer can enable it
+during a curriculum's early phase and disable it after. The bonus is
+proportional to outgoing puck speed * shot quality (forward-projected
+clearance from the opponent paddle), so it rewards aimed shots, not
+random taps.
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ class AirHockeyEnv(gym.Env):
         opponent: Optional[OpponentFn] = None,
         reward_score: float = 10.0,
         reward_concede: float = -10.0,
+        reward_strike_coef: float = 0.5,
         max_episode_steps: int = 800,
         seed: int = 0,
     ):
@@ -41,6 +44,8 @@ class AirHockeyEnv(gym.Env):
         self.opponent = opponent
         self.reward_score = reward_score
         self.reward_concede = reward_concede
+        self.reward_strike_coef = reward_strike_coef
+        self.shaping_enabled = False  # train_sac.py flips this on/off
         self.max_episode_steps = max_episode_steps
         self._step_count = 0
 
@@ -91,8 +96,8 @@ class AirHockeyEnv(gym.Env):
 
         event = self.physics.step(top_accel=top_accel, bot_accel=bot_accel)
 
-        # Pure sparse reward. physics.py convention: "goal_X" means
-        # paddle X scored. The bot is the agent so goal_bot = win.
+        # Sparse reward (always on). physics.py convention: "goal_X"
+        # means paddle X scored. The bot is the agent so goal_bot = win.
         reward = 0.0
         terminated = False
         if event == "goal_bot":
@@ -101,6 +106,29 @@ class AirHockeyEnv(gym.Env):
         elif event == "goal_top":
             reward = self.reward_concede
             terminated = True
+
+        # Curriculum strike shaping. Only fires if the trainer enabled
+        # it (Phase 1 of the curriculum), the bot just hit the puck,
+        # AND the contact happened on the opponent's half — i.e. the
+        # agent had to cross midfield to attack. This rules out
+        # collecting strike bonus on defensive clears.
+        if (
+            self.shaping_enabled
+            and event == "hit_bot"
+            and self.reward_strike_coef > 0.0
+        ):
+            ps = self.physics.state
+            pc = self.physics.cfg
+            on_opponent_half = ps.puck_y < pc.height / 2
+            if on_opponent_half:
+                outgoing = max(0.0, -ps.puck_vy / pc.max_puck_speed)
+                quality = 0.0
+                if outgoing > 0.0 and ps.puck_vy < -1e-3:
+                    tof = max(0.0, (ps.puck_y - ps.top_y) / (-ps.puck_vy))
+                    pred_x = ps.puck_x + ps.puck_vx * tof
+                    clearance = abs(pred_x - ps.top_x)
+                    quality = min(1.0, clearance / (2.0 * pc.paddle_radius))
+                reward += self.reward_strike_coef * outgoing * quality
 
         truncated = self._step_count >= self.max_episode_steps
         obs = self.physics.get_obs(perspective="bot")
