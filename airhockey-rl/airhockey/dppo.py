@@ -1,14 +1,16 @@
 """DPPO — Diffusion Policy Policy Optimization (Ren et al. 2024).
 
-PPO applied to the diffusion sampling process. The diffusion sampler is
-treated as a sequence of K denoising steps; each step is a "sub-action"
-of the outer policy. The clipped surrogate is computed over the
-per-denoising-step likelihood ratio, with advantages from the outer
-environment trajectory broadcast across the inner denoising chain.
+PPO applied to the DDIM sampling chain of a Diffusion Policy. The
+K denoising steps are treated as sub-actions of the outer policy; the
+clipped surrogate is computed over per-denoising-step likelihood
+ratios. Advantages come from the outer-env trajectory.
 
-This module is the *algorithm core*: rollout collection over the env,
-return computation, and the DPPO update step. The training driver lives
-in train_dppo.py.
+The training driver lives in train_dppo.py. This module exposes:
+  - Critic: value MLP
+  - sample_with_chain: DDIM sampling that records (a^k, a^(k-1), t)
+  - per_step_logprob: Gaussian log p(a^(k-1) | a^(k), t, obs)
+  - compute_gae / compute_gae_per_env: GAE over 1D / (T, N) trajectories
+  - dppo_update: PPO step, optionally with a KL-to-BC penalty
 
 Reference: https://arxiv.org/abs/2409.00588
 """
@@ -25,9 +27,8 @@ import torch.nn.functional as F
 from airhockey.policy import DiffusionPolicyConfig, NoiseScheduler, UNet1D
 
 
-# ── Critic head ──────────────────────────────────────────────
 class Critic(nn.Module):
-    """Small MLP value function over observations. Standard PPO critic."""
+    """MLP value function V(obs) -> scalar."""
 
     def __init__(self, obs_dim: int, hidden: int = 256):
         super().__init__()
@@ -43,13 +44,12 @@ class Critic(nn.Module):
         return self.net(obs).squeeze(-1)
 
 
-# ── DPPO sampler with logged denoising trajectory ────────────
 @dataclass
 class SampleResult:
     actions: torch.Tensor              # (B, H, A) final action chunk
-    chain: list[torch.Tensor]          # K+1 entries of (B, H, A) — a^(K), a^(K-1), ..., a^(0)
-    eps_pred: list[torch.Tensor]       # K entries of (B, H, A) — predicted noise at each step
-    timesteps: list[torch.Tensor]       # K entries of (B,) — diffusion timesteps used
+    chain: list[torch.Tensor]          # K+1 entries of (B, H, A): a^K, a^(K-1), ..., a^0
+    eps_pred: list[torch.Tensor]       # K entries of (B, H, A): predicted noise per step
+    timesteps: list[torch.Tensor]      # K entries of (B,): diffusion timesteps used
 
 
 @torch.no_grad()
@@ -59,8 +59,8 @@ def sample_with_chain(
     obs: torch.Tensor,
     n_steps: Optional[int] = None,
 ) -> SampleResult:
-    """DDIM sampling that records the full denoising chain. Used to compute
-    the per-denoising-step log-likelihoods later for the PPO update."""
+    """DDIM sampling that records the full denoising chain for later
+    per-step log-prob computation."""
     cfg = scheduler.cfg
     device = obs.device
     n_steps = n_steps or cfg.n_inference_steps
@@ -101,29 +101,18 @@ def per_step_logprob(
     t: torch.Tensor,
     sigma: float = 0.1,
 ) -> torch.Tensor:
-    """Compute log p(a_next | a_curr, t, obs) under the current model.
-
-    DPPO interprets the deterministic DDIM step as a Gaussian transition
-    centered at the model's prediction with fixed std `sigma`. The
-    log-prob of the (recorded) a_next under that Gaussian is the
-    likelihood whose ratio drives the PPO update.
-
-    All tensors are batched over the rollout dimension; the gradient
-    flows through ε_θ via reparameterization of the predicted mean.
+    """log p(a_next | a_curr, t, obs) treating the DDIM step as a
+    Gaussian N(mean=a0_pred, std=sigma). Gradient flows through eps_theta.
+    Returns (B,) after summing over horizon and action dims.
     """
-    eps = model(a_curr, t, obs)  # gradient flows here
-    # Predicted next sample under DDIM (deterministic mean)
+    eps = model(a_curr, t, obs)
     ab_now = scheduler.alpha_bars[t].view(-1, 1, 1)
-    # Find next ab using the same schedule as the sampler — caller passes via t
-    # For simplicity we approximate the mean using (a_curr - sqrt(1-ab) eps)
     a0_pred = (a_curr - torch.sqrt(1.0 - ab_now) * eps) / torch.sqrt(ab_now)
     a0_pred = a0_pred.clamp(-1.5, 1.5)
-    mean = a0_pred  # simplified: log-prob of recorded a_next under N(mean, sigma)
-    log_prob = -0.5 * ((a_next - mean) / sigma) ** 2 - 0.5 * np.log(2 * np.pi * sigma ** 2)
-    return log_prob.sum(dim=(-1, -2))  # (B,) sum over H, A
+    log_prob = -0.5 * ((a_next - a0_pred) / sigma) ** 2 - 0.5 * np.log(2 * np.pi * sigma ** 2)
+    return log_prob.sum(dim=(-1, -2))
 
 
-# ── GAE advantage ────────────────────────────────────────────
 def compute_gae(
     rewards: np.ndarray,
     values: np.ndarray,
@@ -131,14 +120,10 @@ def compute_gae(
     gamma: float = 0.99,
     lam: float = 0.95,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generalized Advantage Estimation over a SINGLE trajectory.
-    All inputs are (T,) arrays. Returns (advantages, returns) of shape (T,).
-
-    Note: this assumes the inputs come from one contiguous trajectory.
-    If you have trajectories from multiple parallel envs, call this once
-    per env and concatenate the results — never pass mixed-env data as a
-    single sequence, because the `dones` flag from one env's episode
-    boundary would incorrectly reset another env's value bootstrap.
+    """GAE over a single contiguous trajectory. Inputs are (T,). Returns
+    (advantages, returns), both (T,). For multi-env rollouts use
+    compute_gae_per_env — passing mixed-env data through this function
+    will leak episode boundaries across envs.
     """
     T = len(rewards)
     adv = np.zeros(T, dtype=np.float32)
@@ -160,10 +145,7 @@ def compute_gae_per_env(
     gamma: float = 0.99,
     lam: float = 0.95,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """GAE computed independently for each of N parallel envs. Returns
-    (advantages, returns) of shape (T, N). Each env is a separate
-    trajectory and the `dones` flags only affect their own env column.
-    """
+    """GAE computed per env. Inputs are (T, N). Returns (T, N)."""
     T, N = rewards.shape
     adv = np.zeros((T, N), dtype=np.float32)
     for env_i in range(N):
@@ -174,7 +156,6 @@ def compute_gae_per_env(
     return adv, returns
 
 
-# ── DPPO update ──────────────────────────────────────────────
 def dppo_update(
     model: UNet1D,
     critic: Critic,
@@ -183,8 +164,8 @@ def dppo_update(
     optim_critic: torch.optim.Optimizer,
     *,
     obs: torch.Tensor,                  # (B, O)
-    chains_curr: torch.Tensor,           # (B, K, H, A) — a^(k) at step k
-    chains_next: torch.Tensor,           # (B, K, H, A) — a^(k-1) at step k
+    chains_curr: torch.Tensor,           # (B, K, H, A): a^k per step
+    chains_next: torch.Tensor,           # (B, K, H, A): a^(k-1) per step
     timesteps: torch.Tensor,             # (B, K)
     advantages: torch.Tensor,            # (B,)
     returns: torch.Tensor,               # (B,)
@@ -197,13 +178,11 @@ def dppo_update(
     bc_kl_coef: float = 0.0,
     actor_ref: Optional[UNet1D] = None,
 ) -> dict[str, float]:
-    """Run several epochs of PPO updates over the recorded denoising chain.
+    """PPO epochs over the recorded denoising chain.
 
-    If ``bc_kl_coef > 0`` and ``actor_ref`` is provided, an extra KL-to-BC
-    penalty is added to the actor loss. This regularizes the policy back
-    toward the behavior-cloned starting point to prevent catastrophic
-    policy collapse during online RL fine-tuning — one of the standard
-    tricks for DPPO stability.
+    If bc_kl_coef > 0 and actor_ref is provided, adds a KL-to-reference
+    penalty term of the form `bc_kl_coef * (new_lp - ref_lp).mean()`
+    to the actor loss.
     """
     B, K = chains_curr.shape[:2]
     device = obs.device
@@ -230,7 +209,6 @@ def dppo_update(
             mb_ret = returns[mb]
             mb_old_lp = old_logprobs[mb]
 
-            # Compute new log-probs over all K denoising steps
             new_lp_per_k = []
             for k in range(K):
                 lp_k = per_step_logprob(
@@ -239,9 +217,8 @@ def dppo_update(
                 )
                 new_lp_per_k.append(lp_k)
             new_lp = torch.stack(new_lp_per_k, dim=1)   # (B', K)
-            old_lp = mb_old_lp                            # (B', K)
+            old_lp = mb_old_lp
 
-            # Chain-level log-prob
             new_chain_lp = new_lp.sum(dim=1)
             old_chain_lp = old_lp.sum(dim=1)
 
@@ -250,11 +227,8 @@ def dppo_update(
             surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * mb_adv
             ppo_loss = -torch.min(surr1, surr2).mean()
 
-            # KL-to-BC regularization (optional but recommended)
             bc_kl_val = torch.tensor(0.0, device=device)
             if bc_kl_coef > 0.0 and actor_ref is not None:
-                # Compute reference log-probs under the frozen BC model
-                # and penalize divergence. We sum per-step KL contributions.
                 with torch.no_grad():
                     ref_lp_per_k = []
                     for k in range(K):
@@ -264,10 +238,6 @@ def dppo_update(
                         )
                         ref_lp_per_k.append(ref_lp_k)
                     ref_chain_lp = torch.stack(ref_lp_per_k, dim=1).sum(dim=1)
-                # Approx KL(new || ref) ≈ (new_chain_lp - ref_chain_lp).mean()
-                # but we want to penalize the NEW policy from drifting, so
-                # the sign is chosen so the gradient pulls new_chain_lp
-                # toward ref_chain_lp.
                 bc_kl_val = (new_chain_lp - ref_chain_lp).mean()
 
             actor_loss = ppo_loss + bc_kl_coef * bc_kl_val

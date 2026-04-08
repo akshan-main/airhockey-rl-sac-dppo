@@ -1,20 +1,16 @@
-"""Export the trained Diffusion Policy noise predictor to ONNX so it can
-run in the browser via onnxruntime-web.
+"""Export the Diffusion Policy noise predictor to ONNX.
 
-The ONNX graph wraps a single noise-prediction call:
+The graph is a single noise-prediction call:
     inputs:  a (B, H, A) float32, t (B,) int64, obs (B, O) float32
     output:  eps (B, H, A) float32
 
-DDIM sampling is implemented in JavaScript on top of this — the loop runs
-K times, calling the ONNX model each step.
-
-Also writes a small JSON metadata file with the diffusion schedule
-constants the JS sampler needs (alpha_bars at the K inference timesteps).
+Also writes policy.json with the DDIM schedule the JS sampler uses.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +20,7 @@ from airhockey.policy import DiffusionPolicyConfig, NoiseScheduler, UNet1D
 
 
 class NoisePredictorWrapper(torch.nn.Module):
-    """Wraps the UNet so the ONNX exporter sees a clean (a, t, obs) -> eps function."""
+    """Exposes the UNet as a single (a, t, obs) -> eps function."""
 
     def __init__(self, model: UNet1D):
         super().__init__()
@@ -52,6 +48,14 @@ def export(ckpt_path: str, out_dir: str) -> None:
     dummy_obs = torch.zeros(1, O, dtype=torch.float32)
 
     onnx_path = out / "policy.onnx"
+    # dynamo=False because torch >= 2.9's dynamo exporter fails on
+    # this model's GroupNorm + Conv1d + cat pattern. The TorchScript
+    # path produces ONNX that onnxruntime-web loads correctly.
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=".*legacy TorchScript-based ONNX export.*",
+    )
     torch.onnx.export(
         wrapper,
         (dummy_a, dummy_t, dummy_obs),
@@ -65,6 +69,7 @@ def export(ckpt_path: str, out_dir: str) -> None:
             "eps": {0: "batch"},
         },
         opset_version=17,
+        dynamo=False,
     )
     print(f"Wrote {onnx_path}")
 

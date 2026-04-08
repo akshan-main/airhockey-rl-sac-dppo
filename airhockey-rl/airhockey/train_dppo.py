@@ -1,13 +1,11 @@
-"""Stage 2 — DPPO fine-tune of the BC-pretrained Diffusion Policy.
+"""Stage 3 — DPPO fine-tune on top of a BC-pretrained Diffusion Policy.
 
-Online on-policy RL that:
-  1. Rolls out the current diffusion policy across N parallel envs
-  2. Records the full denoising chain at every action sampling event
-  3. Computes GAE advantages from environment rewards
-  4. Runs PPO updates over the per-denoising-step likelihood ratio
-
-Trained from a BC checkpoint produced by `train_bc.py`. Saves the
-fine-tuned actor + critic to ckpt/dppo.pt.
+Loop per rollout batch:
+  1. Sample action chunks for all envs (recording the full DDIM chain)
+  2. Execute each chunk step-by-step across parallel envs
+  3. On chunk completion OR episode reset, flush the chunk into a buffer
+     keyed by env_id
+  4. Compute per-env GAE, then run PPO epochs with optional KL-to-BC
 """
 from __future__ import annotations
 
@@ -15,6 +13,7 @@ import argparse
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -22,7 +21,7 @@ from tqdm import tqdm
 
 from airhockey.dppo import (
     Critic,
-    compute_gae_per_env,
+    compute_gae,
     dppo_update,
     sample_with_chain,
     per_step_logprob,
@@ -36,7 +35,7 @@ from airhockey.snapshot_opponent import load_opponent
 @dataclass
 class DPPOArgs:
     init: str = "ckpt/bc.pt"
-    opponent: str = "ckpt/sac_expert.pt"   # SAC checkpoint for the top-paddle opponent
+    opponent: str = "ckpt/sac_expert.pt"
     out: str = "ckpt/dppo.pt"
     total_steps: int = 2_000_000
     n_envs: int = 16
@@ -49,19 +48,13 @@ class DPPOArgs:
     gae_lam: float = 0.95
     clip_eps: float = 0.2
     sigma: float = 0.1
-    bc_kl_coef: float = 0.05  # KL-to-BC regularization to stop policy collapse
+    bc_kl_coef: float = 0.05
     seed: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def make_envs(n: int, seed: int, opponent_ckpt: str, device: str):
-    """Build a list of envs, each with a frozen SAC opponent loaded
-    from the given checkpoint. We run envs sequentially (not via
-    AsyncVectorEnv) because the env is tiny and not the bottleneck.
-    """
-    # Load the opponent ONCE — all envs can share the same callable
-    # because the SAC actor is stateless and the opponent function
-    # only reads the obs it's given (no shared physics handle).
+    """Build `n` envs sharing a single opponent callable."""
     opponent_fn = load_opponent(opponent_ckpt, device=device, deterministic=True)
     envs = []
     for i in range(n):
@@ -80,7 +73,8 @@ def reset_all(envs, seed: int):
 
 
 def step_all(envs, actions: np.ndarray):
-    """actions: (N, A) — one normalized action per env."""
+    """Step every env one tick. On termination the env is reset and the
+    returned next_obs is the post-reset observation."""
     next_obs = []
     rewards = []
     dones = []
@@ -104,12 +98,10 @@ def step_all(envs, actions: np.ndarray):
 def main(args: DPPOArgs):
     device = torch.device(args.device)
 
-    # ── Load BC checkpoint ────────────────────────────────────
     ckpt = torch.load(args.init, map_location=device)
     cfg = DiffusionPolicyConfig(**ckpt["config"])
     actor = UNet1D(cfg).to(device)
     actor.load_state_dict(ckpt["model"])
-    # Frozen reference for KL-to-BC regularization
     actor_ref = UNet1D(cfg).to(device)
     actor_ref.load_state_dict(ckpt["model"])
     for p in actor_ref.parameters():
@@ -129,34 +121,27 @@ def main(args: DPPOArgs):
     K = cfg.n_inference_steps
     A = cfg.act_dim
 
-    # Per-env action chunk pointer: how many steps of the current chunk
-    # have already been executed. We sample a new chunk when pointer == H.
     chunk_pointer = np.zeros(args.n_envs, dtype=np.int32)
     current_chunks = np.zeros((args.n_envs, H, A), dtype=np.float32)
-    # Per-env stored chain + log-probs from the most recent sampling event,
-    # used as the rollout-time fixed snapshot for the PPO update.
-    pending_chain_curr = [None] * args.n_envs   # each: (K, H, A) tensor
-    pending_chain_next = [None] * args.n_envs
-    pending_timesteps = [None] * args.n_envs
-    pending_old_lp = [None] * args.n_envs
-    pending_obs = [None] * args.n_envs
-
-    # Rollout buffer — stores per-env sequences so we can compute GAE
-    # correctly (independently per env trajectory). Each list has length T,
-    # where each element is either a (N,)-shaped array (scalars) or a
-    # (N, H, A) / (N, K, H, A) / (N, K) stacked tensor.
-    buf_obs: list[torch.Tensor] = []          # each: (N, O)
-    buf_chain_curr: list[torch.Tensor] = []   # each: (N, K, H, A)
-    buf_chain_next: list[torch.Tensor] = []
-    buf_timesteps: list[torch.Tensor] = []
-    buf_old_lp: list[torch.Tensor] = []       # each: (N, K)
-    buf_rewards: list[np.ndarray] = []         # each: (N,)
-    buf_dones: list[np.ndarray] = []
-    buf_values: list[np.ndarray] = []
-
-    # Per-env scratch reward accumulator for the current chunk
+    pending_obs: list[Optional[torch.Tensor]] = [None] * args.n_envs
+    pending_chain_curr: list[Optional[torch.Tensor]] = [None] * args.n_envs
+    pending_chain_next: list[Optional[torch.Tensor]] = [None] * args.n_envs
+    pending_timesteps: list[Optional[torch.Tensor]] = [None] * args.n_envs
+    pending_old_lp: list[Optional[torch.Tensor]] = [None] * args.n_envs
     chunk_reward_acc = np.zeros(args.n_envs, dtype=np.float32)
     chunk_done_acc = np.zeros(args.n_envs, dtype=np.float32)
+
+    # One entry per completed chunk per env; env_id lets us compute GAE
+    # on each env's own trajectory before concatenating for the PPO step.
+    buf_obs: list[torch.Tensor] = []
+    buf_chain_curr: list[torch.Tensor] = []
+    buf_chain_next: list[torch.Tensor] = []
+    buf_timesteps: list[torch.Tensor] = []
+    buf_old_lp: list[torch.Tensor] = []
+    buf_rewards: list[float] = []
+    buf_dones: list[float] = []
+    buf_values: list[float] = []
+    buf_env_id: list[int] = []
 
     return_window = deque(maxlen=50)
     win_window = deque(maxlen=50)
@@ -164,12 +149,14 @@ def main(args: DPPOArgs):
 
     n_total_steps = 0
     n_updates = 0
+    metrics: dict = {"kl": 0.0, "clip_frac": 0.0}
     pbar = tqdm(total=args.total_steps, desc="DPPO")
 
     while n_total_steps < args.total_steps:
         # ── Roll out one rollout_steps batch ───────────────────
         for _ in range(args.rollout_steps):
-            # For each env: if chunk_pointer == 0 we need to sample a new chunk
+            # pointer == 0 means: start of rollout, end of previous chunk,
+            # or env just reset. In all three cases sample a fresh chunk.
             need_sample = chunk_pointer == 0
             if need_sample.any():
                 idx = np.where(need_sample)[0]
@@ -177,11 +164,9 @@ def main(args: DPPOArgs):
                     sub_obs = obs_t[idx]
                     res = sample_with_chain(actor, scheduler, sub_obs, n_steps=K)
                     new_chunks = res.actions.cpu().numpy()
-                    # Compute old log-probs along the chain (per-step)
-                    chain = res.chain  # K+1 tensors of (b, H, A)
-                    chain_curr = torch.stack(chain[:-1], dim=1)  # (b, K, H, A)
-                    chain_next = torch.stack(chain[1:], dim=1)
-                    timesteps = torch.stack(res.timesteps, dim=1)  # (b, K)
+                    chain_curr = torch.stack(res.chain[:-1], dim=1)  # (b, K, H, A)
+                    chain_next = torch.stack(res.chain[1:], dim=1)
+                    timesteps = torch.stack(res.timesteps, dim=1)    # (b, K)
                     old_lp_per_k = []
                     for k in range(K):
                         lp_k = per_step_logprob(
@@ -202,7 +187,6 @@ def main(args: DPPOArgs):
                     chunk_reward_acc[env_i] = 0.0
                     chunk_done_acc[env_i] = 0.0
 
-            # Take the next action from each env's chunk
             actions = current_chunks[np.arange(args.n_envs), chunk_pointer]
             next_obs_np, rewards, dones, infos = step_all(envs, actions)
             chunk_reward_acc += rewards
@@ -213,32 +197,31 @@ def main(args: DPPOArgs):
                 if d:
                     return_window.append(float(cur_ep_return[i]))
                     cur_ep_return[i] = 0.0
-                    # Win = scored a goal in the last episode (top_score increased
-                    # for our paddle = bot_score in env terms... see env mapping)
-                    # We use a simple proxy: episode return > 0 means we likely
-                    # finished with a hit/goal advantage.
-                    win_window.append(1.0 if rewards[i] > 0 else 0.0)
+                    ev = infos[i].get("event", "")
+                    win_window.append(1.0 if ev == "goal_bot" else 0.0)
 
             obs = next_obs_np
             obs_t = torch.from_numpy(obs).to(device)
-            chunk_pointer = (chunk_pointer + 1) % H
 
-            # When ALL envs finish their chunk synchronously, push a
-            # batch to the buffer. This keeps env trajectories aligned
-            # per timestep so per-env GAE is well-defined.
-            all_done = (chunk_pointer == 0).all()
-            if all_done:
-                with torch.no_grad():
-                    stacked_obs = torch.stack([pending_obs[i] for i in range(args.n_envs)])
-                    vals = critic(stacked_obs).cpu().numpy()
-                buf_obs.append(stacked_obs)
-                buf_chain_curr.append(torch.stack([pending_chain_curr[i] for i in range(args.n_envs)]))
-                buf_chain_next.append(torch.stack([pending_chain_next[i] for i in range(args.n_envs)]))
-                buf_timesteps.append(torch.stack([pending_timesteps[i] for i in range(args.n_envs)]))
-                buf_old_lp.append(torch.stack([pending_old_lp[i] for i in range(args.n_envs)]))
-                buf_rewards.append(chunk_reward_acc.copy())
-                buf_dones.append(chunk_done_acc.copy())
-                buf_values.append(vals)
+            # Flush chunks that just completed OR whose env just reset,
+            # and set their pointer back to 0 to trigger a resample.
+            for env_i in range(args.n_envs):
+                advanced_ptr = (chunk_pointer[env_i] + 1) % H
+                if advanced_ptr == 0 or bool(dones[env_i]):
+                    with torch.no_grad():
+                        v = critic(pending_obs[env_i].unsqueeze(0)).item()
+                    buf_obs.append(pending_obs[env_i])
+                    buf_chain_curr.append(pending_chain_curr[env_i])
+                    buf_chain_next.append(pending_chain_next[env_i])
+                    buf_timesteps.append(pending_timesteps[env_i])
+                    buf_old_lp.append(pending_old_lp[env_i])
+                    buf_rewards.append(float(chunk_reward_acc[env_i]))
+                    buf_dones.append(float(chunk_done_acc[env_i]))
+                    buf_values.append(v)
+                    buf_env_id.append(env_i)
+                    chunk_pointer[env_i] = 0
+                else:
+                    chunk_pointer[env_i] = advanced_ptr
 
             n_total_steps += args.n_envs
             pbar.update(args.n_envs)
@@ -248,25 +231,32 @@ def main(args: DPPOArgs):
         if not buf_obs:
             continue
 
-        # ── Compute GAE per-env, then flatten ────────────────
-        # Stack along time axis: shapes become (T, N, ...)
-        rewards_tn = np.stack(buf_rewards)          # (T, N)
-        values_tn = np.stack(buf_values)             # (T, N)
-        dones_tn = np.stack(buf_dones)               # (T, N)
-        adv_tn, returns_tn = compute_gae_per_env(
-            rewards_tn, values_tn, dones_tn,
-            gamma=args.gamma, lam=args.gae_lam,
-        )
-        adv_flat = adv_tn.reshape(-1)                # (T*N,)
-        returns_flat = returns_tn.reshape(-1)
+        # GAE per env on each env's own chunk sequence, then concat.
+        env_ids = np.array(buf_env_id, dtype=np.int32)
+        rewards_np = np.array(buf_rewards, dtype=np.float32)
+        values_np = np.array(buf_values, dtype=np.float32)
+        dones_np = np.array(buf_dones, dtype=np.float32)
+        adv_np = np.zeros_like(rewards_np)
+        ret_np = np.zeros_like(rewards_np)
+        for env_i in range(args.n_envs):
+            mask = env_ids == env_i
+            if not mask.any():
+                continue
+            idxs = np.where(mask)[0]
+            a, r = compute_gae(
+                rewards_np[idxs], values_np[idxs], dones_np[idxs],
+                gamma=args.gamma, lam=args.gae_lam,
+            )
+            adv_np[idxs] = a
+            ret_np[idxs] = r
 
-        obs_batch = torch.cat(buf_obs, dim=0).to(device)            # (T*N, O)
-        chain_curr_batch = torch.cat(buf_chain_curr, dim=0).to(device)
-        chain_next_batch = torch.cat(buf_chain_next, dim=0).to(device)
-        ts_batch = torch.cat(buf_timesteps, dim=0).to(device)
-        old_lp_batch = torch.cat(buf_old_lp, dim=0).to(device)
-        adv_t = torch.from_numpy(adv_flat).to(device)
-        ret_t = torch.from_numpy(returns_flat).to(device)
+        obs_batch = torch.stack(buf_obs).to(device)
+        chain_curr_batch = torch.stack(buf_chain_curr).to(device)
+        chain_next_batch = torch.stack(buf_chain_next).to(device)
+        ts_batch = torch.stack(buf_timesteps).to(device)
+        old_lp_batch = torch.stack(buf_old_lp).to(device)
+        adv_t = torch.from_numpy(adv_np).to(device)
+        ret_t = torch.from_numpy(ret_np).to(device)
 
         metrics = dppo_update(
             actor, critic, scheduler,
@@ -287,7 +277,6 @@ def main(args: DPPOArgs):
         )
         n_updates += 1
 
-        # Clear buffer
         buf_obs.clear()
         buf_chain_curr.clear()
         buf_chain_next.clear()
@@ -296,6 +285,7 @@ def main(args: DPPOArgs):
         buf_rewards.clear()
         buf_dones.clear()
         buf_values.clear()
+        buf_env_id.clear()
 
         avg_ret = float(np.mean(return_window)) if return_window else 0.0
         avg_win = float(np.mean(win_window)) if win_window else 0.0

@@ -1,13 +1,5 @@
-"""Collect demonstration trajectories from a trained SAC expert.
-
-Stage 2a of the pipeline. After training a SAC agent in Stage 1, we use
-it as the "expert" and record its actions over many self-play episodes.
-The resulting (obs, action) dataset is then used to train the Diffusion
-Policy via behavior cloning.
-
-Unlike a hand-engineered heuristic, the expert here is a real RL agent,
-so the demonstrations are of genuine competent play — not of whatever
-rules the author happened to encode.
+"""Roll out a trained SAC expert against a frozen copy of itself and
+save every (obs, action) step as a .npz. Used as the Stage 2 BC dataset.
 """
 from __future__ import annotations
 
@@ -33,7 +25,6 @@ def collect(
     device: str = "cpu",
 ) -> None:
     device_t = torch.device(device)
-    # Load the SAC expert as the bottom-paddle policy
     ckpt = torch.load(expert_ckpt, map_location=device_t, weights_only=False)
     cfg = SACConfig(**ckpt["config"])
     agent = SACAgent(cfg, device=device_t)
@@ -41,8 +32,7 @@ def collect(
     agent.actor.eval()
 
     env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=seed, max_episode_steps=max_steps)
-    # Top paddle opponent: a second copy of the same SAC expert. This is
-    # self-play at "final skill" level — both sides are the same agent.
+    # Top paddle: a second frozen copy of the same SAC expert.
     env.opponent = load_opponent(expert_ckpt, device=device, deterministic=True)
 
     obs_buf: list[np.ndarray] = []
@@ -53,7 +43,6 @@ def collect(
     for ep in tqdm(range(episodes), desc="Collecting"):
         obs, _ = env.reset(seed=seed + ep)
         for t in range(max_steps):
-            # Deterministic expert action
             action = agent.act(obs, deterministic=True).astype(np.float32)
             obs_buf.append(obs.astype(np.float32))
             act_buf.append(action)

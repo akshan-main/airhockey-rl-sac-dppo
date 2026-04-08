@@ -1,20 +1,14 @@
-"""Soft Actor-Critic (Haarnoja et al. 2018) — the Stage 1 expert.
+"""Soft Actor-Critic (Haarnoja et al. 2018).
 
-A compact, self-contained SAC implementation for continuous-control
-2D air hockey. Used to train the initial "expert" agent that generates
-demonstrations for Stage 2 (Diffusion Policy behavior cloning).
+Components:
+  - GaussianActor: MLP with tanh-squashed output
+  - TwinCritic: two Q networks to reduce overestimation
+  - ReplayBuffer: ring buffer
+  - SACAgent: owns the actor, critics, target critics, log_alpha, and
+    the three optimizers. update() runs one gradient step.
 
-Architecture:
-  • Gaussian-MLP actor with a tanh squashed output and the standard
-    reparameterization-trick log-prob correction.
-  • Twin critics (Q1, Q2) to reduce positive bias (as in TD3 / SAC).
-  • Target critics updated via Polyak averaging.
-  • Automatic entropy tuning — `log_alpha` is learned to keep the
-    average entropy near a target (-action_dim by default).
-  • Replay buffer on CPU as a simple ring buffer.
-
-This is the canonical SAC recipe. Hyperparameters are the common
-defaults that work on 10-D MuJoCo-shaped tasks.
+Automatic entropy tuning: log_alpha is a trainable scalar optimized
+toward target_entropy (defaults to -action_dim).
 """
 from __future__ import annotations
 
@@ -33,9 +27,9 @@ LOG_STD_MAX = 2.0
 
 # ── Actor and Critic networks ─────────────────────────────────
 class GaussianActor(nn.Module):
-    """Tanh-squashed Gaussian actor. Outputs (mean, log_std) in the
-    pre-squash Gaussian, then samples via reparameterization and squashes
-    with tanh. Log-probs include the tanh change-of-variable correction.
+    """Outputs (mean, log_std) of a pre-squash Gaussian, samples via
+    reparameterization, then applies tanh. log_prob includes the tanh
+    change-of-variable correction.
     """
 
     def __init__(self, obs_dim: int, act_dim: int, hidden: int = 256):
@@ -56,14 +50,13 @@ class GaussianActor(nn.Module):
         return mean, log_std
 
     def sample(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (action, log_prob). Actions are in [-1, 1]."""
+        """Returns (action in [-1, 1], log_prob)."""
         mean, log_std = self(obs)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
-        pre = normal.rsample()  # reparameterized
+        pre = normal.rsample()
         action = torch.tanh(pre)
-        # log-prob correction for tanh squash:
-        # log p(a) = log N(pre) - sum_i log(1 - tanh(pre_i)^2 + eps)
+        # log p(a) = log N(pre) - sum_i log(1 - tanh(pre_i)^2)
         log_prob = normal.log_prob(pre) - torch.log(1.0 - action.pow(2) + 1e-6)
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         return action, log_prob
@@ -75,7 +68,7 @@ class GaussianActor(nn.Module):
 
 
 class TwinCritic(nn.Module):
-    """Twin Q networks as in SAC. Both take (obs, act) and return a scalar."""
+    """Two Q networks, each (obs, act) -> scalar."""
 
     def __init__(self, obs_dim: int, act_dim: int, hidden: int = 256):
         super().__init__()
@@ -99,7 +92,7 @@ class TwinCritic(nn.Module):
 
 # ── Replay buffer ─────────────────────────────────────────────
 class ReplayBuffer:
-    """Plain CPU ring buffer holding transitions as preallocated arrays."""
+    """Ring buffer of (obs, act, reward, next_obs, done) on CPU."""
 
     def __init__(self, capacity: int, obs_dim: int, act_dim: int):
         self.capacity = capacity
@@ -147,9 +140,8 @@ class SACConfig:
 
 
 class SACAgent:
-    """Bundles the actor, twin critics, target critics, entropy scalar,
-    and the three optimizers. Exposes `update(batch)` for one gradient
-    step and `act(obs)` for rollout."""
+    """Owns the actor, critics, target critics, log_alpha, and three
+    optimizers. Call act(obs) for rollout, update(batch) for training."""
 
     def __init__(self, cfg: SACConfig, device: torch.device | str = "cpu"):
         self.cfg = cfg

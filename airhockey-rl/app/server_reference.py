@@ -1,22 +1,12 @@
-"""FastAPI backend for the live human-vs-RL air hockey demo.
+"""FastAPI backend. Runs on HF Spaces (Docker SDK).
 
-Runs on Hugging Face Spaces (Docker SDK). Three responsibilities:
+Responsibilities:
+  1. Serve the current ONNX model + DDIM schedule JSON to the browser.
+  2. Accept trajectory POSTs, buffer them, flush to HF Buckets.
+  3. Poll HF Hub for new model revisions and hot-reload.
 
-  1. Serve the latest exported ONNX model + its diffusion schedule metadata
-     to the browser via static-style endpoints.
-  2. Accept trajectory POSTs from the browser, buffer them in memory, and
-     flush periodically to HF Buckets so they can be consumed by the
-     periodic retrain job (see airhockey/retrain_cycle.py).
-  3. Poll HF Hub for new model revisions and hot-reload the ONNX file
-     served at /model/policy.onnx without restarting the process.
-
-This server does NOT do any RL updates itself. The periodic retraining
-happens in a GitHub Actions cron job (`.github/workflows/retrain.yml`)
-that pulls new trajectory shards from HF Buckets, runs a small
-behavior-cloning update on the *winning* trajectories, evaluates the
-candidate against the SAC expert, and pushes the promoted model to HF
-Hub. The backend simply hot-reloads the new model when it sees a new
-Hub revision.
+The retrain itself runs in a GitHub Actions cron (retrain_cycle.py),
+not here. This server is I/O + coordination only.
 
 Endpoints:
     GET  /health
@@ -43,7 +33,6 @@ from pydantic import BaseModel, Field
 from airhockey.storage import HFBucketStore
 
 
-# ── Config ──────────────────────────────────────────────────────
 HF_REPO = os.environ.get("HF_REPO_ID", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 ONNX_DIR = Path(os.environ.get("AIRHOCKEY_ONNX_DIR", "onnx"))
@@ -53,7 +42,6 @@ MAX_BUFFER = int(os.environ.get("AIRHOCKEY_MAX_BUFFER", "20000"))
 POLL_INTERVAL_SEC = int(os.environ.get("AIRHOCKEY_POLL_INTERVAL", "60"))
 
 
-# ── Pydantic schemas ────────────────────────────────────────────
 class Step(BaseModel):
     obs: list[float] = Field(..., description="10-D normalized observation")
     action: list[float] = Field(..., description="2-D normalized action")
@@ -73,9 +61,8 @@ class VersionResponse(BaseModel):
     last_flush_unix: float
 
 
-# ── Server state ────────────────────────────────────────────────
 class ServerState:
-    """All mutable shared state lives here behind a single lock."""
+    """Shared mutable state guarded by a single lock."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -96,12 +83,9 @@ class ServerState:
 state = ServerState()
 
 
-# ── Eager model download ────────────────────────────────────────
 def eager_download_model() -> None:
     """Pull policy.onnx + policy.json from HF Hub before the server
-    starts handling requests. Without this, the first 60 seconds after
-    boot return 404 while the polling loop waits to run for the first
-    time.
+    accepts requests, so /model/policy.onnx works from second 0.
     """
     if not HF_REPO:
         print("HF_REPO_ID not set; skipping eager model download")
@@ -121,11 +105,9 @@ def eager_download_model() -> None:
         print(f"Eager download failed (server will still start): {e}")
 
 
-# ── Background loops ────────────────────────────────────────────
 def buffer_flush_loop() -> None:
-    """Every FLUSH_INTERVAL_SEC, or whenever buffer crosses FLUSH_THRESHOLD,
-    push the in-memory queue to HF Buckets as a new shard.
-    """
+    """Flush the in-memory buffer to HF Buckets when it reaches
+    FLUSH_THRESHOLD entries or after FLUSH_INTERVAL_SEC seconds."""
     while True:
         time.sleep(10.0)
         try:
@@ -153,9 +135,8 @@ def buffer_flush_loop() -> None:
 
 
 def hf_hub_poll_loop() -> None:
-    """Every POLL_INTERVAL_SEC, check HF Hub for a new model revision
-    and re-download the ONNX file if it's been updated.
-    """
+    """Poll HF Hub every POLL_INTERVAL_SEC and re-download the ONNX
+    when the repo SHA changes."""
     if not HF_REPO:
         print("HF_REPO_ID not set; skipping Hub polling")
         return
@@ -185,10 +166,8 @@ def hf_hub_poll_loop() -> None:
             print(f"hub poll error: {e}")
 
 
-# ── Lifespan (modern FastAPI startup/shutdown) ─────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
     state.init_storage()
     state.version = 1
     state.last_flush = time.time()
@@ -197,10 +176,8 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=hf_hub_poll_loop, daemon=True).start()
     print(f"Server up. ONNX dir={ONNX_DIR}, repo={HF_REPO or '(unset)'}")
     yield
-    # shutdown (nothing to clean up — daemon threads die with the process)
 
 
-# ── App ─────────────────────────────────────────────────────────
 app = FastAPI(title="Air Hockey RL Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,

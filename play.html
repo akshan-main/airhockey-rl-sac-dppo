@@ -308,10 +308,13 @@ function recordStep(obs, action, reward, done) {
 }
 
 async function onGoal(side) {
-  // Tag the last step as terminal with reward
+  // Tag the last step as terminal with reward, from the POLICY's
+  // perspective. The policy drives the TOP paddle; so if 'bot' (the
+  // human at the bottom) scored, the policy LOST → reward -10. If
+  // 'top' (the policy) scored, reward +10.
   if (recorded.length > 0) {
     const last = recorded[recorded.length - 1];
-    last.reward += (side === 'bot' ? 10 : -10);
+    last.reward += (side === 'top' ? 10 : -10);
     last.done = true;
   }
   // POST to backend

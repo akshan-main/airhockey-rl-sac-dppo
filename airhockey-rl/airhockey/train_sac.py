@@ -1,17 +1,9 @@
 """Stage 1 — Train the SAC expert via self-play.
 
-This is the expert that Stage 2 will distill into a Diffusion Policy.
-
-Self-play schedule:
-  • Start with a no-op opponent (keeps the puck in play long enough for
-    the agent to learn basic hitting).
-  • After `opponent_warmup_steps`, switch the opponent to a frozen snapshot
-    of the current actor.
-  • Every `opponent_refresh_steps`, refresh the frozen opponent to the
-    latest actor weights.
-
-This is the standard self-play loop. It's not perfect (no league, no
-population) but it works well enough for a single-agent target.
+Opponent schedule:
+  - No-op opponent for the first `opponent_warmup_steps` steps.
+  - After warmup, a frozen deepcopy of the current actor.
+  - Refreshed every `opponent_refresh_steps` steps.
 """
 from __future__ import annotations
 
@@ -53,7 +45,6 @@ def main(args: TrainArgs) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # Env starts with a no-op opponent so the agent can learn basic physics
     env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=args.seed, opponent=None)
 
     cfg = SACConfig(obs_dim=env.observation_space.shape[0],
@@ -61,7 +52,6 @@ def main(args: TrainArgs) -> None:
     agent = SACAgent(cfg, device=device)
     buffer = ReplayBuffer(args.buffer_size, cfg.obs_dim, cfg.act_dim)
 
-    # Frozen opponent — starts as None, gets populated after warmup
     frozen_actor: Optional[torch.nn.Module] = None
 
     def frozen_opponent_fn(obs_top: np.ndarray) -> np.ndarray:
@@ -85,17 +75,17 @@ def main(args: TrainArgs) -> None:
     ep_returns: list[float] = []
     ep_lengths: list[int] = []
 
+    latest_metrics: dict[str, float] = {}
     pbar = tqdm(total=args.total_steps, desc="SAC")
     for step in range(args.total_steps):
-        # ── Action ─────────────────────────────────────────
         if step < args.learning_starts:
             action = env.action_space.sample()
         else:
             action = agent.act(obs, deterministic=False)
 
-        # ── Env step ───────────────────────────────────────
         next_obs, reward, term, trunc, info = env.step(action)
-        done = bool(term)  # do not bootstrap on truncation
+        # Do not bootstrap past truncation — only use `term` for the done flag.
+        done = bool(term)
         buffer.push(obs, action, reward, next_obs, done)
 
         ep_return += reward
@@ -109,13 +99,11 @@ def main(args: TrainArgs) -> None:
         else:
             obs = next_obs
 
-        # ── Update ─────────────────────────────────────────
         if step >= args.learning_starts and step % args.update_every == 0:
             for _ in range(args.updates_per_step):
                 batch = buffer.sample(args.batch_size, device)
-                metrics = agent.update(batch)
+                latest_metrics = agent.update(batch)
 
-        # ── Opponent schedule ─────────────────────────────
         if step == args.opponent_warmup_steps:
             refresh_frozen_opponent()
             tqdm.write(f"[step {step}] switched to self-play opponent")
@@ -126,11 +114,16 @@ def main(args: TrainArgs) -> None:
         ):
             refresh_frozen_opponent()
 
-        # ── Logging ────────────────────────────────────────
         if (step + 1) % args.log_every_steps == 0 and ep_returns:
             avg_ret = float(np.mean(ep_returns[-20:]))
             avg_len = float(np.mean(ep_lengths[-20:]))
-            pbar.set_postfix(ret=f"{avg_ret:+.2f}", len=f"{avg_len:.0f}")
+            postfix = {"ret": f"{avg_ret:+.2f}", "len": f"{avg_len:.0f}"}
+            if latest_metrics:
+                postfix["qL"] = f"{latest_metrics.get('q_loss', 0):.2f}"
+                postfix["piL"] = f"{latest_metrics.get('pi_loss', 0):+.2f}"
+                postfix["a"] = f"{latest_metrics.get('alpha', 0):.2f}"
+                postfix["H"] = f"{latest_metrics.get('entropy', 0):.2f}"
+            pbar.set_postfix(**postfix)
 
         pbar.update(1)
 

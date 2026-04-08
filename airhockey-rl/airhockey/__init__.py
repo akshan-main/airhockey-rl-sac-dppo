@@ -1,9 +1,8 @@
-"""Air hockey environment, physics, policies, and training pipeline.
+"""Air hockey env, physics, policies, and training pipeline.
 
-This package is intentionally empty at the top level so individual
-submodules can be imported in minimal environments (e.g. the FastAPI
-backend's Docker image only installs the storage dependencies, not
-torch or gymnasium). Import directly from submodules:
+This package is empty at the top level so individual submodules can be
+imported without pulling in their transitive dependencies. Import from
+submodules directly:
 
     from airhockey.env import AirHockeyEnv
     from airhockey.storage import HFBucketStore

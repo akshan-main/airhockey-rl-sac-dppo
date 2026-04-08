@@ -1,21 +1,12 @@
-"""Gymnasium-compatible air hockey environment.
+"""Gymnasium env. The agent controls the BOTTOM paddle; the TOP paddle
+is driven by `self.opponent`, a callable obs_top -> action in [-1, 1].
 
-Single-agent: the policy controls the BOTTOM paddle. The TOP paddle is
-driven by an opponent — any callable that takes a top-perspective 10-D
-observation and returns a 2-D normalized action in [-1, 1]. In practice
-the opponent is loaded via `airhockey.snapshot_opponent.load_opponent`
-from either a trained SAC checkpoint or a trained Diffusion Policy
-checkpoint, but the env is agnostic to the opponent's implementation.
+Observation: (10,) float32 — see physics.get_obs.
+Action: (2,) float32 in [-1, 1], scaled to physics.max_paddle_accel.
 
-Observation: 10D float32 in [-1, 1] / [0, 1].
-Action: 2D continuous in [-1, 1] interpreted as (ax, ay) accel scaled to
-        physics.max_paddle_accel.
-
-Reward shaping (configurable):
-    +10  on scoring (puck enters opponent goal)
-    -10  on conceding
-    +0.1 on each puck contact by our paddle
-    +0.01 * v_puck_y_normalized   per step (encourages pushing puck up)
+Reward (defaults):
+    +10.0 on scoring, -10.0 on conceding, +0.1 on bot paddle contact,
+    + shaping_coef * (-puck_vy / max_puck_speed) per step
 """
 from __future__ import annotations
 
@@ -29,8 +20,6 @@ from airhockey.physics import AirHockeyPhysics, PhysicsConfig
 
 
 OpponentFn = Callable[[np.ndarray], np.ndarray]
-"""Opponent: takes a 10D observation (top-paddle perspective) and returns
-a 2D normalized action in [-1, 1]."""
 
 
 class AirHockeyEnv(gym.Env):
@@ -64,34 +53,26 @@ class AirHockeyEnv(gym.Env):
             low=-1.0, high=1.0, shape=(2,), dtype=np.float32
         )
 
-    # ── Helpers ───────────────────────────────────────────────
     def _denorm_action(self, action: np.ndarray) -> np.ndarray:
         a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         return a * self.physics.cfg.max_paddle_accel
 
     def _opponent_action(self) -> np.ndarray:
-        """Get the opponent's action, denormalized to physics accel units.
-
-        The opponent callable receives the top paddle's perspective obs
-        (vertically mirrored, so the policy trained as the bottom paddle
-        "sees itself" in its native frame). The policy's output action is
-        interpreted in that same mirrored frame, so to apply it to the
-        world-frame top paddle we flip the y component back.
-        """
+        """The opponent sees a vertically mirrored obs so a bot-trained
+        policy can drive the top paddle. Its output is in that mirrored
+        frame, so we flip the y component back to world coordinates."""
         if self.opponent is None:
             return np.zeros(2, dtype=np.float32)
         obs_top = self.physics.get_obs(perspective="top")
         a = np.asarray(self.opponent(obs_top), dtype=np.float32).copy()
-        a[1] = -a[1]  # mirror y back into world frame
+        a[1] = -a[1]
         return a * self.physics.cfg.max_paddle_accel
 
     def _shaping_reward(self) -> float:
-        s = self.physics.state
-        # Encourage pushing puck toward the top (opponent) goal — i.e. negative y velocity
-        v_norm = -s.puck_vy / self.physics.cfg.max_puck_speed
+        # Positive when puck moves toward the opponent goal (negative vy).
+        v_norm = -self.physics.state.puck_vy / self.physics.cfg.max_puck_speed
         return self.reward_shaping_coef * v_norm
 
-    # ── Gym API ───────────────────────────────────────────────
     def reset(
         self,
         *,
@@ -112,12 +93,14 @@ class AirHockeyEnv(gym.Env):
         top_accel = self._opponent_action()
         event = self.physics.step(top_accel=top_accel, bot_accel=bot_accel)
 
+        # physics.py convention: "goal_X" means paddle X scored. The agent
+        # is the bot paddle, so goal_bot is a win and goal_top is a loss.
         reward = 0.0
         terminated = False
-        if event == "goal_top":
+        if event == "goal_bot":
             reward += self.reward_score
             terminated = True
-        elif event == "goal_bot":
+        elif event == "goal_top":
             reward += self.reward_concede
             terminated = True
         elif event == "hit_bot":

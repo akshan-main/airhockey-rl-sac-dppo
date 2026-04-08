@@ -6,8 +6,8 @@ to-end, not by reading tutorials.
 
 There is a finished reference implementation at `app/server_reference.py`.
 **Do not look at it** while you're writing your own. Look at it only
-after you have something working — or after you get genuinely stuck for
-30+ minutes on the same thing.
+after you have something working — or after you've been stuck on the
+same problem for 30+ minutes.
 
 ## Where the backend sits in the bigger system
 
@@ -172,9 +172,8 @@ handlers and the background loops:
 - The last flush timestamp (unix seconds)
 - The `HFBucketStore` instance (or `None` if unavailable)
 
-The cleanest pattern is a single class instance (`ServerState`) created
-once at module load time. Every endpoint and both background loops read
-from this shared state.
+Wrap it all in a single `ServerState` class instantiated once at module
+load time. Every endpoint and both background loops read from it.
 
 ## Configuration via environment variables
 
@@ -322,8 +321,9 @@ After step 9 you have the full backend.
 - **Step 9**: startup ordering — why the order things happen at boot
   matters for serving requests immediately
 
-By the end of step 9 you will know FastAPI well enough to build other
-small backends without referring to the docs for every line.
+By the end of step 9 you'll have touched routing, Pydantic, thread
+safety, file serving, CORS, lifespan, background threads, external
+API integration, and startup ordering.
 
 ## Tools you'll be using
 
@@ -371,31 +371,20 @@ The kinds of questions I'll redirect you to figure out yourself:
 
 ## When you're done
 
-Tell me, and I'll do an honest review against the same checklist I
-used on the rest of the codebase. Bugs called out, then we move on to
+Tell me, and I'll review it against the same checklist I used on the
+rest of the codebase. Any bugs get called out; then we move on to
 training the model on Colab.
 
-## A few pitfalls the reference implementation originally hit
+## Pitfalls to avoid
 
-These are real mistakes I made while writing `server_reference.py` the
-first time. The reference has since been corrected to avoid them, but
-you should know about them so you don't repeat them:
-
-1. **Used the deprecated `@app.on_event("startup")`** instead of the
-   modern lifespan pattern. Causes warnings on modern FastAPI. The
-   reference now uses `lifespan`.
-2. **Did not eagerly download the model at startup**, so for the first
-   60 seconds after a Space wake-up, `/model/policy.onnx` returned 404.
-   The reference now does an eager download inside `lifespan`.
-3. **Imported `asyncio` and `io` and never used them.** Cosmetic but
-   shows up in linters. The reference no longer has dead imports.
-4. **Used `datetime.utcnow()`** which is deprecated in Python 3.12+.
-   Use `datetime.now(timezone.utc)` instead. This was in `storage.py`,
-   not `server.py` directly, but if you do any timestamps in your
-   server, don't use `utcnow()`.
-
-If you avoid those four, your version will be at least as good as the
-reference.
+1. Use the `lifespan` context manager, not `@app.on_event("startup")`
+   (deprecated in modern FastAPI).
+2. Eagerly download the model from HF Hub inside `lifespan` before
+   background threads start, otherwise the first ~60 seconds after
+   boot return 404 on `/model/policy.onnx`.
+3. Use `datetime.now(timezone.utc)`, not `datetime.utcnow()`
+   (deprecated in Python 3.12+).
+4. Don't leave unused imports (`asyncio`, `io`, etc).
 
 ## What's NOT in scope for your server
 
@@ -412,8 +401,8 @@ Don't try to implement any of these — they live elsewhere:
 - **ONNX export** — already done by `airhockey/export_onnx.py` before
   the model hits HF Hub.
 
-Your server is purely I/O and coordination. If you find yourself
-importing `torch` or anything from `airhockey.policy` / `airhockey.sac`
-/ `airhockey.dppo`, you're out of scope — stop and rethink.
+The server is I/O and coordination only. If you find yourself importing
+`torch` or anything from `airhockey.policy` / `airhockey.sac` /
+`airhockey.dppo`, you're out of scope — stop and rethink.
 
 Good luck. Build small, test each step, ask when stuck.

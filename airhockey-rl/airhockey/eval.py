@@ -1,11 +1,8 @@
-"""Head-to-head evaluation: trained Diffusion Policy vs a configurable opponent.
+"""Head-to-head eval: Diffusion Policy ckpt vs a configurable opponent ckpt.
 
-Loads a Diffusion Policy checkpoint (from BC or DPPO), runs N episodes
-against an opponent loaded from a separate checkpoint (typically the SAC
-expert), reports per-episode return, win rate, and average episode length.
-
-If no opponent checkpoint is provided, the top paddle sits still — useful
-as a pure "can the agent score at all" sanity check.
+Runs N episodes and reports per-episode return, win rate, and average
+length. Pass --opponent to set the top-paddle opponent (SAC or diffusion
+ckpt). Omit it to run against a stationary opponent.
 """
 from __future__ import annotations
 
@@ -43,8 +40,6 @@ def evaluate(
     if opponent_ckpt is not None:
         env.opponent = load_opponent(opponent_ckpt, device=device, deterministic=True)
     else:
-        # No opponent: top paddle sits still. Useful as a pure
-        # "can the agent score at all" sanity check.
         env.opponent = None
 
     returns: list[float] = []
@@ -72,8 +67,7 @@ def evaluate(
             if term or trunc:
                 returns.append(ep_return)
                 lengths.append(steps)
-                # Win iff the terminating event was us scoring on the opponent.
-                wins.append(1 if last_event == "goal_top" else 0)
+                wins.append(1 if last_event == "goal_bot" else 0)
                 break
 
     metrics = {
@@ -93,8 +87,7 @@ def main():
     p.add_argument("--steps", type=int, default=None, help="Override DDIM inference steps")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--opponent", type=str, default=None,
-                   help="Checkpoint for the top-paddle opponent (SAC or Diffusion Policy). "
-                        "If omitted, the opponent sits still.")
+                   help="Checkpoint for the top-paddle opponent (SAC or Diffusion Policy).")
     args = p.parse_args()
 
     m = evaluate(args.ckpt, args.episodes, args.steps, seed=args.seed,

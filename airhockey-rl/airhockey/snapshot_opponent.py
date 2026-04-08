@@ -1,14 +1,7 @@
-"""Frozen-checkpoint opponent for self-play.
+"""load_opponent(ckpt_path) -> (obs -> action) callable.
 
-Given a saved checkpoint, returns an opponent callable that matches the
-`env.OpponentFn` signature: takes a 10-D observation (top paddle frame)
-and returns a 2-D normalized action in [-1, 1].
-
-Supports both checkpoint kinds:
-  • SAC actor-only checkpoint — file produced by train_sac.py
-  • Diffusion Policy checkpoint — file produced by train_bc.py / train_dppo.py
-
-The loader auto-detects the kind by peeking at the saved state dict keys.
+Auto-detects SAC vs Diffusion Policy checkpoints by inspecting the saved
+state dict keys and returns a callable that matches env.OpponentFn.
 """
 from __future__ import annotations
 
@@ -38,18 +31,10 @@ def load_opponent(
     device: str | torch.device = "cpu",
     deterministic: bool = True,
 ) -> OpponentFn:
-    """Load any trained checkpoint and return a (obs -> action) callable.
-
-    Parameters
-    ----------
-    ckpt_path : path to a .pt file saved by train_sac, train_bc, or train_dppo
-    device    : 'cpu' or 'cuda'
-    deterministic : whether to use deterministic actions (no sampling noise)
-    """
+    """Load a SAC or Diffusion Policy checkpoint and return an OpponentFn."""
     device = torch.device(device)
     ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
 
-    # ── SAC checkpoint ────────────────────────────────────────
     if _is_sac_checkpoint(ckpt):
         cfg = SACConfig(**ckpt["config"])
         agent = SACAgent(cfg, device=device)
@@ -61,16 +46,14 @@ def load_opponent(
 
         return sac_opponent
 
-    # ── Diffusion Policy checkpoint ───────────────────────────
     if _is_diffusion_checkpoint(ckpt):
         cfg = DiffusionPolicyConfig(**ckpt["config"])
         model = UNet1D(cfg).to(device).eval()
         model.load_state_dict(ckpt["model"])
         scheduler = NoiseScheduler(cfg, device=device)
 
-        # Each call samples a fresh action chunk and returns the first action.
-        # This is slower than SAC but correct; used only for eval / snapshot
-        # opponents where latency isn't the bottleneck.
+        # Samples a fresh chunk per call and returns the first action.
+        # Does K UNet forwards per env step — only used for eval.
         @torch.no_grad()
         def diffusion_opponent(obs_top: np.ndarray) -> np.ndarray:
             obs_t = torch.from_numpy(obs_top.astype(np.float32)).unsqueeze(0).to(device)

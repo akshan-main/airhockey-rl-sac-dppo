@@ -1,9 +1,10 @@
-"""Air hockey physics — semi-implicit Euler integration with substepping,
-elastic line-of-impact paddle/puck collisions, and wall reflection with
-restitution. NumPy port of the JS reference implementation in index.html.
+"""Air hockey physics.
 
-Coordinate system: (0,0) top-left, x rightward, y downward (canvas-style).
-Top paddle defends y near 0, bottom paddle defends y near GH.
+Semi-implicit Euler with substepping, elastic line-of-impact paddle/puck
+collisions, and wall reflection with restitution.
+
+Coordinate system: (0,0) top-left, x rightward, y downward. Top paddle
+defends y near 0, bottom paddle defends y near height.
 """
 from __future__ import annotations
 
@@ -100,13 +101,16 @@ class AirHockeyPhysics:
         self.state.bot_score = 0
         self.reset(serve_to)
 
-    # ── Physics step ───────────────────────────────────────────
     def step(self, top_accel: np.ndarray, bot_accel: np.ndarray) -> str:
-        """Advance one env step. Each accel is a (2,) array (ax, ay) in
-        canvas units / s². Returns the last event tag."""
+        """Advance one env step. Each accel is (ax, ay) in canvas units/s².
+        Returns one of: "goal_top", "goal_bot", "hit_top", "hit_bot", "".
+        Goals dominate hits: if a goal was scored in any substep, the
+        return value is that goal, not a contact.
+        """
         c = self.cfg
         sub_dt = c.dt / c.substeps
         self.state.last_event = ""
+        step_event = ""
 
         for _ in range(c.substeps):
             self._integrate_paddle("top", top_accel, sub_dt)
@@ -114,13 +118,19 @@ class AirHockeyPhysics:
             self._integrate_puck(sub_dt)
             self._collide_paddle("top")
             self._collide_paddle("bot")
-            if self.state.last_event.startswith("goal"):
-                # reset and stop substepping this frame
-                serve = "top" if self.state.last_event == "goal_bot" else "bot"
-                self.reset(serve_to=serve)
-                break
 
-        return self.state.last_event
+            if self.state.last_event:
+                if self.state.last_event.startswith("goal"):
+                    step_event = self.state.last_event
+                    serve = "top" if step_event == "goal_bot" else "bot"
+                    self.reset(serve_to=serve)
+                    break
+                elif not step_event.startswith("goal"):
+                    step_event = self.state.last_event
+
+        # reset() wipes last_event, so restore it before returning.
+        self.state.last_event = step_event
+        return step_event
 
     # ── Paddle integration (semi-implicit Euler + clamping) ────
     def _integrate_paddle(self, which: str, accel: np.ndarray, dt: float) -> None:

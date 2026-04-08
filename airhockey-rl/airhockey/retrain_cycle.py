@@ -1,25 +1,20 @@
-"""Periodic retraining entry point.
+"""Periodic retrain invoked by the GitHub Actions cron.
 
-Triggered by a GitHub Actions cron job (every 6 hours). Steps:
-
+Steps:
   1. Download the current Diffusion Policy checkpoint from HF Hub
   2. List unprocessed trajectory shards from HF Buckets
-  3. Download them, filter for *winning* trajectories only
-  4. Run a small behavior-cloning update on the winning trajectories
+  3. Filter for winning episodes (terminal reward > 5)
+  4. Run a BC update (DDPM loss) on the winning chunks
   5. Evaluate the candidate against the SAC expert
-  6. Eval gate: only promote if the new model did not regress >5% in win rate
-  7. If promoted, export to ONNX and push to HF Hub
-  8. Mark the consumed shards as processed
+  6. Promote only if win rate did not regress by more than
+     EVAL_REGRESSION_TOLERANCE; on promotion, export ONNX and push
+     to HF Hub
+  7. Mark consumed shards as processed (HF Buckets lifecycle deletes
+     them after N days)
 
-Why BC on winners rather than DPPO:
-  The browser only sends (obs, action, reward, done) per step. The
-  diffusion sampling chain that produced each action is not recorded.
-  Without the chain, DPPO has no per-denoising-step likelihood ratio
-  to compute, so the update reduces to "resample under the current
-  policy," which is a no-op. BC on winners is the honest fallback:
-  treat the agent's own winning trajectories as a small demo dataset
-  and imitate them, which genuinely improves the policy without
-  needing any server-side rollouts.
+The browser only POSTs (obs, action, reward, done), not the full
+denoising chain, so a DPPO-style update is not possible here. BC on
+winners is what we can do with the data we have.
 """
 from __future__ import annotations
 
@@ -29,7 +24,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from airhockey.eval import evaluate
@@ -43,8 +37,8 @@ from airhockey.policy import (
 from airhockey.storage import HFBucketStore
 
 
-# Gate: how much the new model is allowed to drop in win rate vs the
-# previous one before we refuse to promote it.
+# Maximum allowed win-rate drop (vs previous model) before the gate
+# refuses to promote the candidate.
 EVAL_REGRESSION_TOLERANCE = 0.05
 EVAL_EPISODES = 100
 
@@ -102,15 +96,11 @@ def extract_winning_episodes(
     done: np.ndarray,
     horizon: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Filter for episodes that ended in a win (terminal reward > 0).
-    Slice each winning episode into action-chunk windows of length
-    `horizon` and return (obs_windows, action_chunks).
-
-    A "win" is any terminal step with reward above a positive threshold
-    (the env gives +10 on score, so anything > 5 is a safe threshold).
+    """Slice winning episodes into (obs, action_chunk) windows of length
+    `horizon`. A "win" is a terminal step with reward > 5 (the env gives
+    +10 on score).
     """
     N = len(obs)
-    # Find episode boundaries
     boundaries = [0]
     for i in range(N):
         if done[i]:
@@ -122,14 +112,10 @@ def extract_winning_episodes(
     act_chunks: list[np.ndarray] = []
 
     for start, end in zip(boundaries[:-1], boundaries[1:]):
-        ep_len = end - start
-        if ep_len < horizon + 1:
+        if end - start < horizon + 1:
             continue
-        # Check if this episode was a win (last step has big reward)
-        terminal_reward = rew[end - 1]
-        if terminal_reward < 5.0:
+        if rew[end - 1] < 5.0:
             continue
-        # Slice into (obs, action_chunk) windows
         for i in range(start, end - horizon):
             obs_windows.append(obs[i])
             act_chunks.append(act[i : i + horizon])
@@ -153,11 +139,10 @@ def main() -> None:
     store = HFBucketStore()
     keys = store.list_unprocessed_shards()
     if not keys:
-        print("No new shards to process. Exiting cleanly.")
+        print("No new shards to process. Exiting.")
         return
     print(f"Found {len(keys)} unprocessed shards")
 
-    # Concatenate all shards
     obs_list, act_list, rew_list, done_list = [], [], [], []
     for k in keys:
         d = store.download_shard(k)
@@ -171,7 +156,6 @@ def main() -> None:
     done = np.concatenate(done_list).astype(np.float32)
     print(f"Loaded {len(obs):,} transitions from {len(keys)} shards")
 
-    # Filter for winning episodes only
     win_obs, win_chunks = extract_winning_episodes(obs, act, rew, done, cfg.horizon)
     print(f"Extracted {len(win_obs):,} winning-episode chunks")
 
@@ -181,7 +165,6 @@ def main() -> None:
             store.mark_processed(k)
         return
 
-    # ── Behavior-cloning update on winning chunks ─────────────
     obs_t = torch.from_numpy(win_obs).to(device)
     act_t = torch.from_numpy(win_chunks).to(device)
     dataset = TensorDataset(obs_t, act_t)
@@ -204,7 +187,6 @@ def main() -> None:
     avg_loss = total_loss / max(1, n_batches)
     print(f"BC-on-winners update: {n_batches} batches, avg loss {avg_loss:.5f}")
 
-    # Save candidate
     Path("ckpt").mkdir(exist_ok=True)
     candidate_path = "ckpt/candidate.pt"
     torch.save(
@@ -212,7 +194,6 @@ def main() -> None:
         candidate_path,
     )
 
-    # ── Eval gate ─────────────────────────────────────────────
     opponent = OPPONENT_CKPT if Path(OPPONENT_CKPT).exists() else None
     print(f"Evaluating previous model ({LOCAL_CKPT}) against {opponent or 'no opponent'}…")
     prev_metrics = evaluate(LOCAL_CKPT, episodes=EVAL_EPISODES, seed=12345,
@@ -232,7 +213,7 @@ def main() -> None:
     )
 
     if promoted:
-        print("✓ Candidate passed eval gate, promoting to served checkpoint")
+        print("Candidate passed eval gate, promoting.")
         shutil.copy(candidate_path, LOCAL_CKPT)
         Path(LOCAL_ONNX).mkdir(exist_ok=True)
         export_onnx(LOCAL_CKPT, LOCAL_ONNX)
@@ -243,10 +224,10 @@ def main() -> None:
         print(f"Marked {len(keys)} shards as processed")
     else:
         print(
-            "✗ Candidate FAILED eval gate "
-            f"(win rate dropped by more than {EVAL_REGRESSION_TOLERANCE:.2f})"
+            f"Candidate failed eval gate "
+            f"(win rate dropped by more than {EVAL_REGRESSION_TOLERANCE:.2f}). "
+            f"Keeping previous served checkpoint."
         )
-        print("Keeping the previous served checkpoint.")
         if HF_REPO and HF_TOKEN:
             try:
                 from huggingface_hub import HfApi
@@ -262,8 +243,8 @@ def main() -> None:
                 )
             except Exception as e:
                 print(f"Failed to upload rejected candidate: {e}")
-        # IMPORTANT: do NOT mark shards as processed if we rejected.
-        # They will be re-tried in the next cycle with a fresh policy.
+        # Shards are NOT marked processed when the gate rejects, so the
+        # next cycle will see them again.
 
 
 if __name__ == "__main__":
