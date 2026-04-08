@@ -4,9 +4,6 @@ This is the exact sequence of cells to run in a Colab notebook with
 a T4 GPU to train all three stages end-to-end and push the result
 to Hugging Face Hub.
 
-Total wall-clock time: **~5-7 hours**. Colab free tier gives ~12 hours
-of T4 time per session so it fits in one sitting.
-
 ## Setup
 
 1. Open https://colab.research.google.com/
@@ -43,28 +40,40 @@ print(f"obs: {obs.shape}, action_space: {env.action_space}")
 
 Expected: `obs: (10,), action_space: Box(-1.0, 1.0, (2,), float32)`.
 
-## Cell 3 — Stage 1: Train the SAC expert (~1-2 hours)
+## Cell 3 — Stage 1: Train the SAC expert
 
 ```python
 !python -m airhockey.train_sac \
     --total-steps 1000000 \
-    --opponent-warmup-steps 50000 \
-    --opponent-refresh-steps 50000 \
     --out ckpt/sac_expert.pt
 ```
 
-Watch the tqdm bar. The `ret` metric should climb from ~-1 to ~+5 by
-the end. The `len` metric (episode length) should first shrink (as the
-agent learns to score fast) then stabilize around 200-400.
+Watch the tqdm bar:
 
-If `ret` is stuck near 0 or negative after 200K steps, something is
-wrong — stop and check the SAC logs.
+- `a` (alpha) must stay above ~0.05 — if it prints `0.000` entropy has
+  collapsed and the run is dead
+- `H` (entropy) should sit near -1.0
+- `ret` will drop at step 50K when the league switches on; that's
+  normal because opponents just got harder
 
-## Cell 4 — Stage 2a: Collect demonstrations from the SAC expert (~10-15 min)
+The real quality signal is `ckpt/eval.csv`, written every 50K steps
+(current actor vs scripted AND stationary, 30 episodes each). The best
+checkpoint by average win rate is saved to `ckpt/sac_expert.best.pt`.
+
+Abort gates — run `!cat ckpt/eval.csv` and kill the run if:
+
+- Step 100K: win_rate vs scripted < 0.15 or vs none < 0.10
+- Step 300K: vs scripted < 0.35 or vs none < 0.30
+- Step 1M: vs scripted < 0.50 or vs none < 0.60
+
+All downstream stages should use `ckpt/sac_expert.best.pt`, not the
+last-step `ckpt/sac_expert.pt`.
+
+## Cell 4 — Stage 2a: Collect demonstrations from the SAC expert
 
 ```python
 !python -m airhockey.collect \
-    --expert ckpt/sac_expert.pt \
+    --expert ckpt/sac_expert.best.pt \
     --episodes 5000 \
     --out data/demos.npz \
     --device cuda
@@ -81,7 +90,7 @@ Check the file exists:
 
 Should be ~50-150 MB depending on episode lengths.
 
-## Cell 5 — Stage 2b: Train Diffusion Policy via BC on SAC demos (~30-45 min)
+## Cell 5 — Stage 2b: Train Diffusion Policy via BC on SAC demos
 
 ```python
 !python -m airhockey.train_bc \
@@ -98,12 +107,12 @@ first 20 epochs, and end near 0.01-0.03 by epoch 200. If it stalls at
 >0.1, the dataset isn't providing enough signal (check that Stage 1's
 SAC actually learned to play).
 
-## Cell 6 — Stage 3: DPPO fine-tune (~3-4 hours)
+## Cell 6 — Stage 3: DPPO fine-tune
 
 ```python
 !python -m airhockey.train_dppo \
     --init ckpt/bc.pt \
-    --opponent ckpt/sac_expert.pt \
+    --opponent ckpt/sac_expert.best.pt \
     --total-steps 2000000 \
     --n-envs 16 \
     --rollout-steps 128 \
@@ -113,7 +122,7 @@ SAC actually learned to play).
     --out ckpt/dppo.pt
 ```
 
-This is the long one. Watch four metrics in the tqdm postfix:
+Watch four metrics in the tqdm postfix:
 
 - `ret`: should climb over the course of training
 - `win`: should climb from ~0.5 (parity with SAC) upward
@@ -127,13 +136,13 @@ You can use the BC checkpoint as your final model instead.
 
 ```python
 # Eval SAC against itself (sanity — should be around 0.5)
-!python -m airhockey.eval --ckpt ckpt/bc.pt --opponent ckpt/sac_expert.pt --episodes 200
+!python -m airhockey.eval --ckpt ckpt/bc.pt --opponent ckpt/sac_expert.best.pt --episodes 200
 
 # Eval BC against SAC
-!python -m airhockey.eval --ckpt ckpt/bc.pt --opponent ckpt/sac_expert.pt --episodes 200
+!python -m airhockey.eval --ckpt ckpt/bc.pt --opponent ckpt/sac_expert.best.pt --episodes 200
 
 # Eval DPPO against SAC
-!python -m airhockey.eval --ckpt ckpt/dppo.pt --opponent ckpt/sac_expert.pt --episodes 200
+!python -m airhockey.eval --ckpt ckpt/dppo.pt --opponent ckpt/sac_expert.best.pt --episodes 200
 ```
 
 The headline number is DPPO's win rate vs SAC. Anything ≥ 0.55 is a
@@ -184,7 +193,7 @@ os.environ["HF_DATASET_REPO"] = "akshan-main/airhockey-demos"
 
 ```python
 from google.colab import files
-files.download("ckpt/sac_expert.pt")
+files.download("ckpt/sac_expert.best.pt")
 files.download("ckpt/bc.pt")
 files.download("ckpt/dppo.pt")
 files.download("onnx/policy.onnx")
