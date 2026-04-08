@@ -51,6 +51,26 @@ def scripted_tracker(obs: np.ndarray) -> np.ndarray:
     return np.array([ax, ay], dtype=np.float32)
 
 
+def with_action_noise(fn, std: float, seed: int = 0):
+    """Wrap an opponent_fn so its actions get isotropic Gaussian noise.
+
+    Used both during training (so the league's scripted opponent isn't
+    perfectly deterministic and the agent can't memorize it) and during
+    eval (so an honest win rate isn't inflated by exploiting a fixed
+    behavior pattern).
+    """
+    if fn is None or std <= 0.0:
+        return fn
+    rng = np.random.default_rng(seed)
+
+    def noisy(obs: np.ndarray) -> np.ndarray:
+        a = np.asarray(fn(obs), dtype=np.float32)
+        a = a + rng.normal(0.0, std, size=a.shape).astype(np.float32)
+        return np.clip(a, -1.0, 1.0)
+
+    return noisy
+
+
 @torch.no_grad()
 def run_eval(
     agent: SACAgent,
@@ -59,6 +79,7 @@ def run_eval(
     seed: int = 0,
     physics_config: PhysicsConfig | None = None,
     progress: bool = False,
+    opponent_noise_std: float = 0.0,
 ) -> dict[str, float]:
     """Run N episodes of `agent` vs `opponent_fn` and return metrics.
 
@@ -66,7 +87,7 @@ def run_eval(
     loop. Uses a fresh env so it won't perturb the caller's env state.
     """
     env = AirHockeyEnv(physics_config=physics_config or PhysicsConfig(), seed=seed)
-    env.opponent = opponent_fn
+    env.opponent = with_action_noise(opponent_fn, opponent_noise_std, seed=seed)
     agent.actor.eval()
 
     returns: list[float] = []
@@ -132,13 +153,17 @@ def evaluate_sac(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     seed: int = 0,
     opponent_ckpt: str | None = None,
+    opponent_noise_std: float = 0.05,
 ) -> dict[str, float]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = SACConfig(**ckpt["config"])
     agent = SACAgent(cfg, device=device)
     agent.load_state_dict(ckpt)
     opponent_fn = resolve_opponent(opponent_ckpt, self_ckpt_path=ckpt_path, device=device)
-    return run_eval(agent, opponent_fn, episodes=episodes, seed=seed, progress=True)
+    return run_eval(
+        agent, opponent_fn, episodes=episodes, seed=seed, progress=True,
+        opponent_noise_std=opponent_noise_std,
+    )
 
 
 def main():
@@ -149,10 +174,13 @@ def main():
     p.add_argument("--opponent", type=str, default=None,
                    help="Opponent: a ckpt path, 'scripted' (default), "
                         "'self' (eval vs same ckpt), or 'none' (stationary).")
+    p.add_argument("--opponent-noise", type=float, default=0.05,
+                   help="Gaussian action noise std applied to the opponent.")
     args = p.parse_args()
 
     m = evaluate_sac(args.ckpt, args.episodes, seed=args.seed,
-                     opponent_ckpt=args.opponent)
+                     opponent_ckpt=args.opponent,
+                     opponent_noise_std=args.opponent_noise)
     print()
     print(f"Checkpoint: {args.ckpt}")
     print(f"Opponent:   {args.opponent or 'no-op (stationary)'}")

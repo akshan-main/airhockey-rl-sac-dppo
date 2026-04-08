@@ -23,10 +23,10 @@ class PhysicsConfig:
     puck_radius: float = 11.0
     paddle_radius: float = 19.0
     puck_mass: float = 1.0
-    paddle_mass: float = 4.0
+    paddle_mass: float = 20.0  # held-by-hand paddle is effectively very heavy
     e_wall: float = 0.94
     e_paddle: float = 0.96
-    drag: float = 0.18  # linear damping per second
+    drag: float = 0.05  # linear damping per second (low — air hockey table)
     max_puck_speed: float = 950.0
     max_paddle_speed: float = 700.0
     max_paddle_accel: float = 4500.0

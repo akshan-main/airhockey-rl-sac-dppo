@@ -50,6 +50,7 @@ class AirHockeyEnv(gym.Env):
         reward_approach_coef: float = 0.05,
         reward_home_coef: float = 0.005,
         reward_time_coef: float = 0.001,
+        reward_jerk_coef: float = 0.02,
         max_episode_steps: int = 800,
         seed: int = 0,
     ):
@@ -62,9 +63,11 @@ class AirHockeyEnv(gym.Env):
         self.reward_approach_coef = reward_approach_coef
         self.reward_home_coef = reward_home_coef
         self.reward_time_coef = reward_time_coef
+        self.reward_jerk_coef = reward_jerk_coef
         self.max_episode_steps = max_episode_steps
         self._step_count = 0
         self._prev_dist = None  # bot-paddle <-> puck distance at previous step
+        self._prev_action = None  # last commanded action (for jerk penalty)
 
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(10,), dtype=np.float32
@@ -72,10 +75,6 @@ class AirHockeyEnv(gym.Env):
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(2,), dtype=np.float32
         )
-
-    def _denorm_action(self, action: np.ndarray) -> np.ndarray:
-        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
-        return a * self.physics.cfg.max_paddle_accel
 
     def _opponent_action(self) -> np.ndarray:
         """The opponent sees a vertically mirrored obs so a bot-trained
@@ -143,13 +142,20 @@ class AirHockeyEnv(gym.Env):
         self.physics.hard_reset(serve_to=serve)
         self._step_count = 0
         self._prev_dist = None
+        self._prev_action = None
         obs = self.physics.get_obs(perspective="bot")
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         self._step_count += 1
-        bot_accel = self._denorm_action(action)
+        action_arr = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        bot_accel = action_arr * self.physics.cfg.max_paddle_accel
         top_accel = self._opponent_action()
+
+        # Snapshot puck pre-step so we can log the goal-shot location.
+        s0 = self.physics.state
+        pre_puck = (s0.puck_x, s0.puck_y, s0.puck_vx, s0.puck_vy)
+
         event = self.physics.step(top_accel=top_accel, bot_accel=bot_accel)
 
         # physics.py convention: "goal_X" means paddle X scored. The agent
@@ -174,10 +180,22 @@ class AirHockeyEnv(gym.Env):
 
         reward += self._shaping_reward()
 
+        # Jerk penalty: -coef * ||a_t - a_{t-1}||^2. Encourages smooth,
+        # human-looking paddle motion instead of frame-to-frame thrash.
+        if self._prev_action is not None:
+            jerk = float(np.sum((action_arr - self._prev_action) ** 2))
+            reward -= self.reward_jerk_coef * jerk
+        self._prev_action = action_arr
+
         truncated = self._step_count >= self.max_episode_steps
         obs = self.physics.get_obs(perspective="bot")
-        info = {"event": event, "top_score": self.physics.state.top_score,
-                "bot_score": self.physics.state.bot_score}
+        info = {
+            "event": event,
+            "top_score": self.physics.state.top_score,
+            "bot_score": self.physics.state.bot_score,
+        }
+        if event.startswith("goal"):
+            info["goal_puck"] = pre_puck
         return obs, float(reward), terminated, truncated, info
 
     def render(self):

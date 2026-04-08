@@ -32,7 +32,7 @@ import torch
 from tqdm import tqdm
 
 from airhockey.env import AirHockeyEnv
-from airhockey.eval_sac import run_eval, scripted_tracker
+from airhockey.eval_sac import run_eval, scripted_tracker, with_action_noise
 from airhockey.physics import PhysicsConfig
 from airhockey.sac import ReplayBuffer, SACAgent, SACConfig
 
@@ -41,6 +41,39 @@ from airhockey.sac import ReplayBuffer, SACAgent, SACConfig
 LEAGUE_SCRIPTED_PROB = 0.40
 LEAGUE_STATIONARY_PROB = 0.15
 LEAGUE_SNAPSHOT_PROB = 0.45
+
+# Noise on the scripted opponent (training league + eval) so the agent
+# can't memorize a fixed action sequence.
+SCRIPTED_NOISE_STD = 0.05
+
+
+# ── Horizontal mirroring (data augmentation) ───────────────────
+# The env is left-right symmetric. Every (obs, action, reward, next_obs)
+# tuple has a valid mirrored counterpart we can also push to the buffer
+# — doubles effective data per env step at no rollout cost.
+#
+# Obs layout from physics.get_obs (perspective="bot"):
+#   [0] puck_x  [1] puck_y  [2] puck_vx  [3] puck_vy
+#   [4] bot_x   [5] bot_y   [6] bot_vx   [7] bot_vy
+#   [8] top_x   [9] top_y
+# Mirroring x: positions 0,4,8 → 1 - p; velocities 2,6 → -v.
+_MIRROR_POS_IDX = (0, 4, 8)
+_MIRROR_VEL_IDX = (2, 6)
+
+
+def mirror_obs(obs: np.ndarray) -> np.ndarray:
+    o = obs.copy()
+    for i in _MIRROR_POS_IDX:
+        o[i] = 1.0 - o[i]
+    for i in _MIRROR_VEL_IDX:
+        o[i] = -o[i]
+    return o
+
+
+def mirror_action(a: np.ndarray) -> np.ndarray:
+    out = a.copy()
+    out[0] = -out[0]
+    return out
 
 
 @dataclass
@@ -72,10 +105,16 @@ def main(args: TrainArgs) -> None:
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    # Training env. Opponent starts as scripted tracker so the agent has
-    # a moving opponent from step 0; swapped to the league after warmup.
+    # Noisy scripted opponent — used both as the warmup opponent and as
+    # the scripted slot in the league. The noise prevents memorization.
+    noisy_scripted = with_action_noise(
+        scripted_tracker, SCRIPTED_NOISE_STD, seed=args.seed + 101,
+    )
+
+    # Training env. Opponent starts as the scripted tracker so the agent
+    # has a moving opponent from step 0; swapped to the league after warmup.
     env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=args.seed,
-                       opponent=scripted_tracker)
+                       opponent=noisy_scripted)
 
     cfg = SACConfig(obs_dim=env.observation_space.shape[0],
                     act_dim=env.action_space.shape[0])
@@ -98,12 +137,12 @@ def main(args: TrainArgs) -> None:
         if r < LEAGUE_STATIONARY_PROB:
             return _stationary_opponent(obs_top)
         if r < LEAGUE_STATIONARY_PROB + LEAGUE_SCRIPTED_PROB:
-            return scripted_tracker(obs_top)
+            return noisy_scripted(obs_top)
         if opponent_league:
             snapshot = league_rng.choice(list(opponent_league))
             return _sampled_policy_fn(snapshot)(obs_top)
         # Fallback before any snapshot exists.
-        return scripted_tracker(obs_top)
+        return noisy_scripted(obs_top)
 
     def add_snapshot_to_league() -> None:
         snap = copy.deepcopy(agent.actor).eval()
@@ -119,10 +158,13 @@ def main(args: TrainArgs) -> None:
     best_path = out_path.with_suffix(".best.pt")
     train_csv_path = out_dir / "train.csv"
     eval_csv_path = out_dir / "eval.csv"
+    goals_csv_path = out_dir / "goals.csv"
     train_csv = open(train_csv_path, "w", newline="")
     eval_csv = open(eval_csv_path, "w", newline="")
+    goals_csv = open(goals_csv_path, "w", newline="")
     train_writer = csv.writer(train_csv)
     eval_writer = csv.writer(eval_csv)
+    goals_writer = csv.writer(goals_csv)
     train_writer.writerow([
         "step", "ep_return_mean", "ep_length_mean",
         "q_loss", "pi_loss", "alpha", "entropy",
@@ -131,6 +173,9 @@ def main(args: TrainArgs) -> None:
         "step", "opponent",
         "win_rate", "loss_rate", "draw_rate",
         "mean_return", "mean_length", "n_episodes",
+    ])
+    goals_writer.writerow([
+        "step", "scored", "puck_x", "puck_y", "puck_vx", "puck_vy",
     ])
 
     best_score = -float("inf")
@@ -148,7 +193,7 @@ def main(args: TrainArgs) -> None:
         nonlocal best_score
         metrics_scripted = run_eval(
             agent, scripted_tracker, episodes=args.eval_episodes,
-            seed=10_000 + step,
+            seed=10_000 + step, opponent_noise_std=SCRIPTED_NOISE_STD,
         )
         metrics_none = run_eval(
             agent, None, episodes=args.eval_episodes,
@@ -190,7 +235,23 @@ def main(args: TrainArgs) -> None:
         next_obs, reward, term, trunc, info = env.step(action)
         # Do not bootstrap past truncation — only `term` flags the done.
         done = bool(term)
-        buffer.push(obs, action, reward, next_obs, done)
+        action_arr = np.asarray(action, dtype=np.float32)
+        buffer.push(obs, action_arr, reward, next_obs, done)
+        # Mirrored counterpart — env is left-right symmetric, so this is
+        # a valid extra training transition.
+        buffer.push(
+            mirror_obs(obs), mirror_action(action_arr),
+            reward, mirror_obs(next_obs), done,
+        )
+
+        # Goal location logging.
+        if "goal_puck" in info:
+            gx, gy, gvx, gvy = info["goal_puck"]
+            goals_writer.writerow([
+                step + 1,
+                1 if info["event"] == "goal_bot" else 0,
+                f"{gx:.2f}", f"{gy:.2f}", f"{gvx:.2f}", f"{gvy:.2f}",
+            ])
 
         ep_return += reward
         ep_length += 1
@@ -250,6 +311,7 @@ def main(args: TrainArgs) -> None:
 
     pbar.close()
     train_csv.close()
+    goals_csv.close()
 
     # Final checkpoint. If we never evaluated, `best` wasn't written —
     # do one final eval so the report is complete and `best.pt` exists.
