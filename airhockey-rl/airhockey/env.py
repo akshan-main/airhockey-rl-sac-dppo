@@ -5,8 +5,10 @@ Observation: (10,) float32 — see physics.get_obs.
 Action: (2,) float32 in [-1, 1], scaled to physics.max_paddle_accel.
 
 Reward (defaults):
-    +10.0 on scoring, -10.0 on conceding, +0.1 on bot paddle contact,
-    + shaping_coef * (-puck_vy / max_puck_speed) per step
+    +10.0 on scoring, -10.0 on conceding. Dense shaping is small on
+    purpose so the sparse goal reward dominates: a small hit bonus, a
+    small "puck moving toward opponent" term, a small "puck on their
+    side" term, a small approach-the-puck term, and a tiny time penalty.
 """
 from __future__ import annotations
 
@@ -31,10 +33,10 @@ class AirHockeyEnv(gym.Env):
         opponent: Optional[OpponentFn] = None,
         reward_score: float = 10.0,
         reward_concede: float = -10.0,
-        reward_hit: float = 0.3,
+        reward_hit: float = 0.1,
         reward_vel_coef: float = 0.02,
         reward_puck_side_coef: float = 0.005,
-        reward_approach_coef: float = 0.5,
+        reward_approach_coef: float = 0.1,
         reward_time_coef: float = 0.001,
         max_episode_steps: int = 800,
         seed: int = 0,

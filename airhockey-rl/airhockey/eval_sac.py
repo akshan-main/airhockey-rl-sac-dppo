@@ -52,6 +52,80 @@ def scripted_tracker(obs: np.ndarray) -> np.ndarray:
 
 
 @torch.no_grad()
+def run_eval(
+    agent: SACAgent,
+    opponent_fn,
+    episodes: int,
+    seed: int = 0,
+    physics_config: PhysicsConfig | None = None,
+    progress: bool = False,
+) -> dict[str, float]:
+    """Run N episodes of `agent` vs `opponent_fn` and return metrics.
+
+    Shared by the CLI eval below and by periodic eval inside the training
+    loop. Uses a fresh env so it won't perturb the caller's env state.
+    """
+    env = AirHockeyEnv(physics_config=physics_config or PhysicsConfig(), seed=seed)
+    env.opponent = opponent_fn
+    agent.actor.eval()
+
+    returns: list[float] = []
+    lengths: list[int] = []
+    wins: list[int] = []
+    losses: list[int] = []
+
+    iterator = range(episodes)
+    if progress:
+        iterator = tqdm(iterator, desc="Eval-SAC")
+
+    for ep in iterator:
+        obs, _ = env.reset(seed=seed + ep)
+        ep_return = 0.0
+        steps = 0
+        last_event = ""
+        while True:
+            action = agent.act(obs.astype(np.float32), deterministic=True)
+            obs, reward, term, trunc, info = env.step(action)
+            evt = info.get("event", "")
+            if evt.startswith("goal"):
+                last_event = evt
+            ep_return += reward
+            steps += 1
+            if term or trunc:
+                returns.append(ep_return)
+                lengths.append(steps)
+                wins.append(1 if last_event == "goal_bot" else 0)
+                losses.append(1 if last_event == "goal_top" else 0)
+                break
+
+    return {
+        "mean_return": float(np.mean(returns)),
+        "median_return": float(np.median(returns)),
+        "win_rate": float(np.mean(wins)),
+        "loss_rate": float(np.mean(losses)),
+        "draw_rate": float(1.0 - np.mean(wins) - np.mean(losses)),
+        "mean_length": float(np.mean(lengths)),
+        "n_episodes": len(returns),
+    }
+
+
+def resolve_opponent(
+    name: str | None,
+    self_ckpt_path: str | None = None,
+    device: str = "cpu",
+):
+    """Map a CLI opponent name to a callable obs_top -> action."""
+    if name is None or name == "scripted":
+        return scripted_tracker
+    if name == "none":
+        return None
+    if name == "self":
+        if self_ckpt_path is None:
+            raise ValueError("opponent='self' requires a checkpoint path")
+        return load_opponent(self_ckpt_path, device=device, deterministic=True)
+    return load_opponent(name, device=device, deterministic=True)
+
+
 def evaluate_sac(
     ckpt_path: str,
     episodes: int = 200,
@@ -63,46 +137,8 @@ def evaluate_sac(
     cfg = SACConfig(**ckpt["config"])
     agent = SACAgent(cfg, device=device)
     agent.load_state_dict(ckpt)
-    agent.actor.eval()
-
-    env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=seed)
-    if opponent_ckpt is None or opponent_ckpt == "scripted":
-        env.opponent = scripted_tracker
-    elif opponent_ckpt == "none":
-        env.opponent = None
-    elif opponent_ckpt == "self":
-        env.opponent = load_opponent(ckpt_path, device=device, deterministic=True)
-    else:
-        env.opponent = load_opponent(opponent_ckpt, device=device, deterministic=True)
-
-    returns: list[float] = []
-    lengths: list[int] = []
-    wins: list[int] = []
-
-    for ep in tqdm(range(episodes), desc="Eval-SAC"):
-        obs, _ = env.reset(seed=seed + ep)
-        ep_return = 0.0
-        steps = 0
-        last_event = ""
-        while True:
-            action = agent.act(obs.astype(np.float32), deterministic=True)
-            obs, reward, term, trunc, info = env.step(action)
-            last_event = info.get("event", "") or last_event
-            ep_return += reward
-            steps += 1
-            if term or trunc:
-                returns.append(ep_return)
-                lengths.append(steps)
-                wins.append(1 if last_event == "goal_bot" else 0)
-                break
-
-    return {
-        "mean_return": float(np.mean(returns)),
-        "median_return": float(np.median(returns)),
-        "win_rate": float(np.mean(wins)),
-        "mean_length": float(np.mean(lengths)),
-        "n_episodes": len(returns),
-    }
+    opponent_fn = resolve_opponent(opponent_ckpt, self_ckpt_path=ckpt_path, device=device)
+    return run_eval(agent, opponent_fn, episodes=episodes, seed=seed, progress=True)
 
 
 def main():
