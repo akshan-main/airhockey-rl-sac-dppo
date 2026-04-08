@@ -4,11 +4,24 @@ is driven by `self.opponent`, a callable obs_top -> action in [-1, 1].
 Observation: (10,) float32 — see physics.get_obs.
 Action: (2,) float32 in [-1, 1], scaled to physics.max_paddle_accel.
 
-Reward (defaults):
-    +10.0 on scoring, -10.0 on conceding. Dense shaping is small on
-    purpose so the sparse goal reward dominates: a small hit bonus, a
-    small "puck moving toward opponent" term, a small "puck on their
-    side" term, a small approach-the-puck term, and a tiny time penalty.
+Reward shape — designed to teach defend → strike → return:
+
+  +10.0 on scoring, -10.0 on conceding (sparse, dominant).
+
+  STRIKE event: on a bot/puck contact, bonus proportional to the puck's
+  outgoing speed *toward the opponent goal*. A hard shot is worth a lot
+  more than a tap, so the agent has an incentive to wind up rather than
+  just bump.
+
+  Per-step shaping is conditional on puck side:
+    - Puck on the bot's defensive half → small reward for closing the
+      distance to the puck (defend / intercept).
+    - Puck on the opponent's half → small reward for being near home y
+      (retreat / reset position after a strike).
+
+  Plus a tiny time penalty so dawdling isn't free. All shaping terms
+  are small enough that they accumulate to roughly ±2 over a full
+  800-step episode, so the sparse ±10 goal reward stays in charge.
 """
 from __future__ import annotations
 
@@ -33,10 +46,9 @@ class AirHockeyEnv(gym.Env):
         opponent: Optional[OpponentFn] = None,
         reward_score: float = 10.0,
         reward_concede: float = -10.0,
-        reward_hit: float = 0.1,
-        reward_vel_coef: float = 0.02,
-        reward_puck_side_coef: float = 0.005,
-        reward_approach_coef: float = 0.1,
+        reward_strike_coef: float = 0.5,
+        reward_approach_coef: float = 0.05,
+        reward_home_coef: float = 0.005,
         reward_time_coef: float = 0.001,
         max_episode_steps: int = 800,
         seed: int = 0,
@@ -46,10 +58,9 @@ class AirHockeyEnv(gym.Env):
         self.opponent = opponent
         self.reward_score = reward_score
         self.reward_concede = reward_concede
-        self.reward_hit = reward_hit
-        self.reward_vel_coef = reward_vel_coef
-        self.reward_puck_side_coef = reward_puck_side_coef
+        self.reward_strike_coef = reward_strike_coef
         self.reward_approach_coef = reward_approach_coef
+        self.reward_home_coef = reward_home_coef
         self.reward_time_coef = reward_time_coef
         self.max_episode_steps = max_episode_steps
         self._step_count = 0
@@ -82,25 +93,38 @@ class AirHockeyEnv(gym.Env):
         return float(np.hypot(s.puck_x - s.bot_x, s.puck_y - s.bot_y))
 
     def _shaping_reward(self) -> float:
+        """Per-step shaping. Conditional on which half the puck is in.
+
+        Defensive half (puck_y > height/2): reward closing distance to
+        the puck, so the agent learns to intercept.
+        Offensive half (puck_y < height/2): reward being near home y, so
+        the agent learns to retreat after a strike instead of camping
+        forward.
+        """
         s = self.physics.state
         c = self.physics.cfg
-        # Puck velocity toward opponent goal (up = negative vy).
-        v_norm = -s.puck_vy / c.max_puck_speed
-        # Puck position bias: +1 at opponent wall, -1 at our wall.
-        side = 1.0 - 2.0 * (s.puck_y / c.height)
-        # Approach: reward the bot paddle for reducing its distance to
-        # the puck. This gives a gradient even when the puck is at rest.
+        on_bot_half = s.puck_y > c.height / 2
+
         cur_dist = self._puck_distance()
-        if self._prev_dist is None:
+        if self._prev_dist is None or not on_bot_half:
             approach = 0.0
         else:
             delta = self._prev_dist - cur_dist  # positive when approaching
             approach = delta / c.max_paddle_speed
         self._prev_dist = cur_dist
+
+        if on_bot_half:
+            home_term = 0.0
+        else:
+            # Distance from home y, normalized to [0, 1]. We use the
+            # paddle's max-y position (its closest-to-wall point) as
+            # "home" — a defender's resting spot.
+            home_err = abs(s.bot_y - self.physics.bot_max_y) / c.height
+            home_term = -home_err
+
         return (
-            self.reward_vel_coef * v_norm
-            + self.reward_puck_side_coef * side
-            + self.reward_approach_coef * approach
+            self.reward_approach_coef * approach
+            + self.reward_home_coef * home_term
             - self.reward_time_coef
         )
 
@@ -139,7 +163,14 @@ class AirHockeyEnv(gym.Env):
             reward += self.reward_concede
             terminated = True
         elif event == "hit_bot":
-            reward += self.reward_hit
+            # Strike bonus: outgoing puck speed toward the opponent goal
+            # (negative vy is up, toward y=0). A hard shot is rewarded
+            # much more than a tap, so the agent has a reason to wind up.
+            outgoing = max(
+                0.0,
+                -self.physics.state.puck_vy / self.physics.cfg.max_puck_speed,
+            )
+            reward += self.reward_strike_coef * outgoing
 
         reward += self._shaping_reward()
 
