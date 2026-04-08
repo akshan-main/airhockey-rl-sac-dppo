@@ -1,0 +1,42 @@
+# Top-level ignores for the airhockey-rl-sac-dppo repo.
+# The project-specific ignores live in airhockey-rl/.gitignore.
+
+# Unrelated skills-section demos from before the RL project
+# (these live in a separate side project, not this repo)
+index.html
+index2.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+
+# ML artifacts
+*.npz
+*.pt
+*.onnx
+ckpt/
+data/
+onnx/
+runs/
+wandb/
+mlruns/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Secrets
+.env
+.env.*
+!.env.example

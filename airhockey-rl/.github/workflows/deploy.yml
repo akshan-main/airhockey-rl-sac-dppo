@@ -1,0 +1,33 @@
+name: Deploy to Hugging Face Space
+
+# Pushes the FastAPI backend (the airhockey-rl repo contents) to a
+# Hugging Face Space whenever main is updated. The Space is configured
+# with the Docker SDK and uses app/Dockerfile to build.
+#
+# Required secrets:
+#   HF_TOKEN     — a Hugging Face access token with write scope on the Space
+#   HF_SPACE     — owner/space (e.g. username/airhockey-rl)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ secrets.HF_SPACE }}
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "github-actions"
+          git remote add space "https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}"
+          git push space main --force

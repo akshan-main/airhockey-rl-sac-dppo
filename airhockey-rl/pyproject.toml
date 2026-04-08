@@ -1,0 +1,32 @@
+[project]
+name = "airhockey-rl"
+version = "0.1.0"
+description = "Diffusion Policy + DPPO for 2D air hockey"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.26",
+    "gymnasium>=0.29",
+    "tqdm>=4.66",
+    "onnx>=1.15",
+    "onnxruntime>=1.17",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "black", "ruff"]
+hub = ["huggingface_hub>=0.20", "minari"]
+storage = ["boto3>=1.34"]
+app = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2",
+    "boto3>=1.34",
+    "huggingface_hub>=0.20",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["airhockey"]

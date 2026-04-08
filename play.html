@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Air Hockey — Play vs Diffusion Policy</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+    color: #c9d1d9;
+  }
+  .wrap { display: flex; gap: 24px; align-items: stretch; }
+  .game-side { width: 320px; height: 540px; }
+  .game-side canvas {
+    width: 100%; height: 100%; display: block;
+    border-radius: 10px;
+    border: 1px solid rgba(88,166,255,0.2);
+  }
+  .info {
+    width: 320px;
+    display: flex; flex-direction: column;
+    gap: 14px; padding: 16px;
+    border: 1px solid rgba(88,166,255,0.15);
+    border-radius: 10px;
+    background: rgba(88,166,255,0.03);
+    font-size: 13px;
+  }
+  .info h2 { font-size: 15px; color: #58a6ff; margin-bottom: 4px; }
+  .info p { color: rgba(255,255,255,0.7); line-height: 1.5; }
+  .stat { display: flex; justify-content: space-between; }
+  .stat .k { color: rgba(255,255,255,0.5); }
+  .stat .v { color: #58a6ff; font-family: monospace; }
+  .badge {
+    display: inline-block; padding: 3px 8px; border-radius: 4px;
+    background: rgba(63,185,80,0.15); color: #3fb950;
+    font-size: 11px; font-weight: 600;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="game-side"><canvas id="c"></canvas></div>
+  <div class="info">
+    <h2>Play vs Diffusion Policy</h2>
+    <p>Move your mouse over the canvas to control the bottom paddle. The
+    top paddle is a Diffusion Policy trained via DPPO. Each completed
+    game's trajectory is sent to the backend for online fine-tuning.</p>
+    <div class="stat"><span class="k">Backend</span><span class="v" id="backend">—</span></div>
+    <div class="stat"><span class="k">Model version</span><span class="v" id="version">—</span></div>
+    <div class="stat"><span class="k">Score (you / AI)</span><span class="v" id="score">0 / 0</span></div>
+    <div class="stat"><span class="k">Trajectories sent</span><span class="v" id="sent">0</span></div>
+    <div class="stat"><span class="k">Inference</span><span class="v" id="infer">—</span></div>
+    <p style="font-size:11px; color:rgba(255,255,255,0.4); margin-top:8px;">
+      Backend: FastAPI on Hugging Face Spaces, runs DPPO updates from
+      submitted trajectories. Model is hot-reloaded into the browser
+      when a new version is available.
+    </p>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  Air hockey play page — Diffusion Policy via ONNX runtime
+// ═══════════════════════════════════════════════════════════════
+//
+// This page hosts the live "human vs trained AI" mode. The trained
+// policy is loaded from a FastAPI backend that lives on a Hugging
+// Face Space; the browser polls for new model versions and hot-
+// reloads the ONNX session when the backend has fine-tuned the
+// policy from collected human gameplay.
+//
+// Most of the physics is the same as index.html. The differences:
+//   • Bottom paddle is mouse-controlled (you).
+//   • Top paddle is the Diffusion Policy: every H steps we run K
+//     denoising iterations of the ONNX noise predictor with DDIM
+//     to produce a new action chunk.
+//   • Each completed game is recorded and POSTed to the backend.
+
+const BACKEND = window.AIRHOCKEY_BACKEND || "https://akshan-main-airhockey-rl-backend.hf.space";
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const GW = 320, GH = 540;
+const DPR = window.devicePixelRatio || 1;
+cv.width = GW * DPR; cv.height = GH * DPR;
+ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+// ── Physics constants (must match airhockey/physics.py) ────
+const WALL = 12;
+const GOAL_W = 110;
+const GOAL_X1 = (GW - GOAL_W) / 2;
+const GOAL_X2 = (GW + GOAL_W) / 2;
+const PUCK_R = 11;
+const PADDLE_R = 19;
+const PUCK_MASS = 1;
+const PADDLE_MASS = 4;
+const E_WALL = 0.94;
+const E_PADDLE = 0.96;
+const DRAG = 0.18;
+const DT = 1 / 50;
+const SUBSTEPS = 3;
+const MAX_PUCK_SPEED = 950;
+const MAX_PADDLE_SPEED = 700;
+const MAX_PADDLE_ACCEL = 4500;
+
+const FIELD_X1 = WALL + PUCK_R, FIELD_X2 = GW - WALL - PUCK_R;
+const FIELD_Y1 = WALL + PUCK_R, FIELD_Y2 = GH - WALL - PUCK_R;
+
+// ── Game state ────────────────────────────────────────────
+const puck = { x: GW/2, y: GH/2, vx: 0, vy: 0 };
+const top = { x: GW/2, y: WALL + PADDLE_R + 60, vx: 0, vy: 0 }; // RL
+const bot = { x: GW/2, y: GH - WALL - PADDLE_R - 60, vx: 0, vy: 0 }; // human
+let topScore = 0, botScore = 0;
+let mouse = { x: GW/2, y: GH - WALL - PADDLE_R - 60 };
+
+cv.addEventListener('mousemove', (e) => {
+  const r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * (GW / r.width);
+  mouse.y = (e.clientY - r.top) * (GH / r.height);
+});
+
+function resetPuck(serveTo) {
+  puck.x = GW/2;
+  puck.y = serveTo === 'top' ? GH * 0.28 : GH * 0.72;
+  puck.vx = 0; puck.vy = 0;
+  top.x = GW/2; top.vx = 0; top.vy = 0;
+}
+resetPuck('top');
+
+// ── Physics helpers (mirror physics.py) ────────────────────
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+function integratePaddle(p, ax, ay, dt, isTop) {
+  const aMag = Math.hypot(ax, ay);
+  if (aMag > MAX_PADDLE_ACCEL) {
+    ax = ax / aMag * MAX_PADDLE_ACCEL;
+    ay = ay / aMag * MAX_PADDLE_ACCEL;
+  }
+  p.vx += ax * dt; p.vy += ay * dt;
+  const sp = Math.hypot(p.vx, p.vy);
+  if (sp > MAX_PADDLE_SPEED) {
+    p.vx = p.vx / sp * MAX_PADDLE_SPEED;
+    p.vy = p.vy / sp * MAX_PADDLE_SPEED;
+  }
+  p.x += p.vx * dt; p.y += p.vy * dt;
+  p.x = clamp(p.x, WALL + PADDLE_R, GW - WALL - PADDLE_R);
+  if (isTop) {
+    const ny = clamp(p.y, WALL + PADDLE_R, GH/2 - PADDLE_R);
+    if (ny !== p.y) { p.vy = 0; p.y = ny; }
+  } else {
+    const ny = clamp(p.y, GH/2 + PADDLE_R, GH - WALL - PADDLE_R);
+    if (ny !== p.y) { p.vy = 0; p.y = ny; }
+  }
+}
+
+function integratePuck(dt) {
+  const damp = Math.max(0, 1 - DRAG * dt);
+  puck.vx *= damp; puck.vy *= damp;
+  const sp = Math.hypot(puck.vx, puck.vy);
+  if (sp > MAX_PUCK_SPEED) {
+    puck.vx = puck.vx / sp * MAX_PUCK_SPEED;
+    puck.vy = puck.vy / sp * MAX_PUCK_SPEED;
+  }
+  puck.x += puck.vx * dt; puck.y += puck.vy * dt;
+  if (puck.x < FIELD_X1) { puck.x = FIELD_X1; puck.vx = -puck.vx * E_WALL; }
+  else if (puck.x > FIELD_X2) { puck.x = FIELD_X2; puck.vx = -puck.vx * E_WALL; }
+  if (puck.y < FIELD_Y1) {
+    if (puck.x > GOAL_X1 + PUCK_R && puck.x < GOAL_X2 - PUCK_R) {
+      botScore++;
+      onGoal('bot');
+      return;
+    }
+    puck.y = FIELD_Y1; puck.vy = -puck.vy * E_WALL;
+  }
+  if (puck.y > FIELD_Y2) {
+    if (puck.x > GOAL_X1 + PUCK_R && puck.x < GOAL_X2 - PUCK_R) {
+      topScore++;
+      onGoal('top');
+      return;
+    }
+    puck.y = FIELD_Y2; puck.vy = -puck.vy * E_WALL;
+  }
+}
+
+function collide(p) {
+  const dx = puck.x - p.x, dy = puck.y - p.y;
+  const d = Math.hypot(dx, dy);
+  const md = PUCK_R + PADDLE_R;
+  if (d >= md || d < 1e-3) return;
+  const nx = dx/d, ny = dy/d;
+  const vrx = puck.vx - p.vx, vry = puck.vy - p.vy;
+  const vrn = vrx * nx + vry * ny;
+  if (vrn >= 0) return;
+  const j = -(1 + E_PADDLE) * vrn / (1/PUCK_MASS + 1/PADDLE_MASS);
+  puck.vx += (j/PUCK_MASS) * nx;
+  puck.vy += (j/PUCK_MASS) * ny;
+  p.vx -= (j/PADDLE_MASS) * nx;
+  p.vy -= (j/PADDLE_MASS) * ny;
+  const overlap = md - d;
+  puck.x += nx * overlap;
+  puck.y += ny * overlap;
+}
+
+// ── Observation builder (matches physics.get_obs perspective='top') ──
+function topObs() {
+  // Mirror y so the policy (trained as bottom paddle) sees the world
+  // from the top paddle's frame.
+  return Float32Array.from([
+    puck.x / GW,
+    1.0 - puck.y / GH,
+    puck.vx / MAX_PUCK_SPEED,
+    -puck.vy / MAX_PUCK_SPEED,
+    top.x / GW,
+    1.0 - top.y / GH,
+    top.vx / MAX_PADDLE_SPEED,
+    -top.vy / MAX_PADDLE_SPEED,
+    bot.x / GW,
+    1.0 - bot.y / GH,
+  ]);
+}
+
+// ── ONNX runtime + DDIM sampling ──────────────────────────
+let session = null;
+let schedule = null;
+let modelVersion = 0;
+let actionChunk = null;
+let chunkPointer = 0;
+
+async function loadModel() {
+  document.getElementById('infer').textContent = 'loading…';
+  try {
+    const meta = await fetch(`${BACKEND}/model/policy.json`).then(r => r.json());
+    schedule = meta;
+    session = await ort.InferenceSession.create(`${BACKEND}/model/policy.onnx`, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
+    const v = await fetch(`${BACKEND}/model/version`).then(r => r.json());
+    modelVersion = v.version;
+    document.getElementById('version').textContent = v.version;
+    document.getElementById('backend').textContent = 'connected';
+    document.getElementById('infer').textContent = 'ready';
+  } catch (e) {
+    document.getElementById('backend').textContent = 'offline';
+    document.getElementById('infer').textContent = 'fallback (random)';
+    console.error(e);
+  }
+}
+
+async function sampleChunk(obs) {
+  if (!session || !schedule) {
+    // Fallback: small random action
+    const out = new Float32Array(schedule ? schedule.horizon * schedule.act_dim : 16);
+    for (let i = 0; i < out.length; i++) out[i] = (Math.random() - 0.5) * 0.4;
+    return out;
+  }
+  const H = schedule.horizon, A = schedule.act_dim, K = schedule.n_inference_steps;
+  // Initialize a from N(0, I)
+  let a = new Float32Array(H * A);
+  for (let i = 0; i < a.length; i++) a[i] = randn();
+
+  for (let k = 0; k < K; k++) {
+    const tVal = BigInt(schedule.timesteps[k]);
+    const tTensor = new ort.Tensor('int64', BigInt64Array.from([tVal]), [1]);
+    const aTensor = new ort.Tensor('float32', a, [1, H, A]);
+    const obsTensor = new ort.Tensor('float32', obs, [1, schedule.obs_dim]);
+    const out = await session.run({ a: aTensor, t: tTensor, obs: obsTensor });
+    const eps = out.eps.data;
+    const abNow = schedule.alpha_bars[k];
+    const abNext = schedule.alpha_bars_next[k];
+    const sNow = Math.sqrt(abNow), sNowC = Math.sqrt(1 - abNow);
+    const sNext = Math.sqrt(abNext), sNextC = Math.sqrt(1 - abNext);
+    for (let i = 0; i < a.length; i++) {
+      const a0 = clamp((a[i] - sNowC * eps[i]) / sNow, -1.5, 1.5);
+      a[i] = sNext * a0 + sNextC * eps[i];
+    }
+  }
+  for (let i = 0; i < a.length; i++) a[i] = clamp(a[i], -1, 1);
+  return a;
+}
+
+function randn() {
+  let u = 0, v = 0;
+  while (!u) u = Math.random();
+  while (!v) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// ── Trajectory recording for online updates ──────────────
+const recorded = [];
+let trajectoriesSent = 0;
+
+function recordStep(obs, action, reward, done) {
+  recorded.push({
+    obs: Array.from(obs),
+    action: Array.from(action),
+    reward,
+    done,
+  });
+}
+
+async function onGoal(side) {
+  // Tag the last step as terminal with reward
+  if (recorded.length > 0) {
+    const last = recorded[recorded.length - 1];
+    last.reward += (side === 'bot' ? 10 : -10);
+    last.done = true;
+  }
+  // POST to backend
+  if (recorded.length > 5) {
+    try {
+      await fetch(`${BACKEND}/trajectory`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          steps: recorded.slice(),
+          model_version: modelVersion,
+        }),
+      });
+      trajectoriesSent++;
+      document.getElementById('sent').textContent = trajectoriesSent;
+    } catch (e) { console.warn('upload failed', e); }
+  }
+  recorded.length = 0;
+  document.getElementById('score').textContent = `${botScore} / ${topScore}`;
+  resetPuck(side);
+  actionChunk = null;
+  chunkPointer = 0;
+}
+
+// ── Periodic version polling for hot reload ──────────────
+async function pollVersion() {
+  try {
+    const v = await fetch(`${BACKEND}/model/version`).then(r => r.json());
+    if (v.version !== modelVersion) {
+      console.log(`Hot reloading model: ${modelVersion} → ${v.version}`);
+      session = await ort.InferenceSession.create(`${BACKEND}/model/policy.onnx?v=${v.version}`, {
+        executionProviders: ['wasm'],
+      });
+      modelVersion = v.version;
+      document.getElementById('version').textContent = v.version;
+    }
+  } catch {}
+}
+setInterval(pollVersion, 10000);
+
+// ── Human paddle PD targeting from mouse ──────────────────
+function humanPaddleAccel() {
+  const tx = clamp(mouse.x, WALL + PADDLE_R, GW - WALL - PADDLE_R);
+  const ty = clamp(mouse.y, GH/2 + PADDLE_R, GH - WALL - PADDLE_R);
+  const kp = 220, kd = 2 * Math.sqrt(220);
+  const ax = kp * (tx - bot.x) - kd * bot.vx;
+  const ay = kp * (ty - bot.y) - kd * bot.vy;
+  return [ax, ay];
+}
+
+// ── Render ────────────────────────────────────────────────
+function draw() {
+  ctx.fillStyle = '#0a0d14'; ctx.fillRect(0, 0, GW, GH);
+  ctx.fillStyle = '#161b22';
+  ctx.fillRect(0, 0, GW, WALL);
+  ctx.fillRect(0, GH - WALL, GW, WALL);
+  ctx.fillRect(0, 0, WALL, GH);
+  ctx.fillRect(GW - WALL, 0, WALL, GH);
+  ctx.fillStyle = '#0a0d14';
+  ctx.fillRect(GOAL_X1, 0, GOAL_W, WALL);
+  ctx.fillRect(GOAL_X1, GH - WALL, GOAL_W, WALL);
+  ctx.strokeStyle = 'rgba(88,166,255,0.18)'; ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 6]);
+  ctx.beginPath(); ctx.moveTo(WALL, GH/2); ctx.lineTo(GW - WALL, GH/2); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Top paddle (RL — orange-ish)
+  ctx.strokeStyle = 'rgba(247,129,102,0.95)'; ctx.lineWidth = 3;
+  ctx.fillStyle = 'rgba(247,129,102,0.18)';
+  ctx.beginPath(); ctx.arc(top.x, top.y, PADDLE_R, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Bottom paddle (you — blue)
+  ctx.strokeStyle = 'rgba(88,166,255,0.95)'; ctx.lineWidth = 3;
+  ctx.fillStyle = 'rgba(88,166,255,0.18)';
+  ctx.beginPath(); ctx.arc(bot.x, bot.y, PADDLE_R, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Puck
+  ctx.shadowColor = '#fff'; ctx.shadowBlur = 12;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(puck.x, puck.y, PUCK_R, 0, Math.PI*2); ctx.fill();
+  ctx.shadowBlur = 0;
+}
+
+// ── Main loop ─────────────────────────────────────────────
+async function loop() {
+  // Sample a new action chunk for the AI top paddle if needed
+  if (!actionChunk || chunkPointer >= (schedule ? schedule.horizon : 8)) {
+    const obs = topObs();
+    actionChunk = await sampleChunk(obs);
+    chunkPointer = 0;
+  }
+  const H = schedule ? schedule.horizon : 8;
+  const A = schedule ? schedule.act_dim : 2;
+  let aiAx = actionChunk[chunkPointer * A] * MAX_PADDLE_ACCEL;
+  let aiAy = actionChunk[chunkPointer * A + 1] * MAX_PADDLE_ACCEL;
+  // Mirror y back (we used mirrored obs/actions for the top paddle)
+  aiAy = -aiAy;
+  chunkPointer++;
+
+  const [humanAx, humanAy] = humanPaddleAccel();
+
+  // Record observation BEFORE the step (from top perspective for the policy)
+  const obsForRecord = topObs();
+  const actionForRecord = new Float32Array([
+    actionChunk[(chunkPointer - 1) * A],
+    actionChunk[(chunkPointer - 1) * A + 1],
+  ]);
+
+  // Substep physics
+  const sdt = DT / SUBSTEPS;
+  for (let s = 0; s < SUBSTEPS; s++) {
+    integratePaddle(top, aiAx, aiAy, sdt, true);
+    integratePaddle(bot, humanAx, humanAy, sdt, false);
+    integratePuck(sdt);
+    collide(top);
+    collide(bot);
+  }
+
+  // Tiny shaping reward (per the env spec)
+  const stepReward = 0.01 * (puck.vy / MAX_PUCK_SPEED); // positive when puck heads down (away from RL)
+  recordStep(obsForRecord, actionForRecord, stepReward, false);
+
+  draw();
+  requestAnimationFrame(loop);
+}
+
+(async () => {
+  await loadModel();
+  loop();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+name: Periodic BC-on-Winners Retrain
+
+# Runs the periodic retrain cycle every 6 hours:
+#   1. Pulls new human-vs-AI trajectory shards from HF Buckets
+#   2. Filters for *winning* episodes (those where the agent scored)
+#   3. Runs a small behavior-cloning update on those winning trajectories
+#   4. Evaluates the candidate against the SAC expert
+#   5. If the candidate did not regress win rate by more than 5%, exports
+#      to ONNX and pushes to HF Hub
+#   6. Marks consumed shards as processed (HF Buckets lifecycle handles deletion)
+#
+# The HF Spaces backend polls the Hub and hot-reloads the served ONNX
+# when a new revision appears.
+#
+# Required GitHub secrets:
+#   HF_TOKEN           Hugging Face access token (write scope on the model repo)
+#   HF_REPO_ID         username/airhockey-dppo
+#   HF_BUCKET_NAME     name of the HF Bucket holding the trajectory shards
+#   HF_BUCKET_KEY_ID   S3 access key id for the bucket
+#   HF_BUCKET_SECRET   S3 secret access key for the bucket
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:        # allow manual runs
+
+concurrency:
+  group: airhockey-retrain
+  cancel-in-progress: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('airhockey-rl/pyproject.toml') }}
+
+      - name: Install dependencies
+        working-directory: airhockey-rl
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy gymnasium tqdm onnx boto3 huggingface_hub
+          pip install -e .
+
+      - name: Run retrain cycle
+        working-directory: airhockey-rl
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+          HF_BUCKET_NAME: ${{ secrets.HF_BUCKET_NAME }}
+          HF_BUCKET_ENDPOINT: https://buckets.hf.co
+          HF_BUCKET_KEY_ID: ${{ secrets.HF_BUCKET_KEY_ID }}
+          HF_BUCKET_SECRET: ${{ secrets.HF_BUCKET_SECRET }}
+        run: python -m airhockey.retrain_cycle

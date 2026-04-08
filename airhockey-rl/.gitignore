@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Training artifacts
+ckpt/
+data/
+onnx/
+minari_export/
+*.npz
+*.pt
+*.onnx
+runs/
+wandb/
+mlruns/
+lightning_logs/
+
+# Exception: keep card/spec files
+!MODEL_CARD.md
+!DATASET_CARD.md
+!MINARI_CARD.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+.env
+.env.*
+!.env.example
