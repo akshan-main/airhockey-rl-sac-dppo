@@ -1,20 +1,31 @@
 """Stage 1 — Train the SAC expert via self-play.
 
-Opponent schedule:
-  - Scripted tracker for the first `opponent_warmup_steps` steps so the
-    agent sees a moving opponent immediately.
-  - After warmup, a league: 40% scripted, 15% stationary (no-op), 45%
-    stochastic snapshots of past selves. The league is refreshed every
-    `opponent_refresh_steps` steps.
+Opponent curriculum (key insight from earlier failed runs: under pure
+sparse reward, the agent never stumbles into a goal vs a stationary
+center-blocker by random exploration, so vs-none stays at 0% forever
+unless we force the issue early):
+
+  Phase 1 (0 → curriculum_warmup_steps):
+    80% stationary, 10% attacker, 10% tracker, 0% snapshots.
+    Pure aiming practice. The agent has to learn to angle shots around
+    a fixed blocker, because that's what 80% of episodes look like.
+    The 10/10 attacker+tracker share keeps it from forgetting how to
+    handle moving opponents entirely.
+
+  Phase 2 (curriculum_warmup_steps → curriculum_blend_end):
+    Linear ramp from Phase 1 mix to Phase 3 mix. Snapshots are added
+    to the league once the first one is taken (at curriculum_warmup_steps).
+
+  Phase 3 (curriculum_blend_end → end):
+    Steady-state league: 30% tracker, 30% attacker, 15% stationary,
+    25% snapshot. Refreshed every opponent_refresh_steps.
 
 Periodic eval: every `eval_every_steps` steps the current actor is
-evaluated (deterministic) against scripted and stationary opponents for
-`eval_episodes` episodes each. The average win rate across both is the
-selection metric — the best-so-far is saved to `<out>.best.pt`. The
-final checkpoint is saved to `<out>`.
+evaluated (deterministic) against scripted, attacker, and stationary
+opponents. Average win rate across all three is the selection metric;
+best-so-far saves to `<out>.best.pt`, final to `<out>`.
 
-Logging: `train.csv` (per log interval) and `eval.csv` (per eval) in
-the output directory, plus a tqdm progress bar.
+Logs: `train.csv`, `eval.csv`, `goals.csv` in the output directory.
 """
 from __future__ import annotations
 
@@ -42,15 +53,52 @@ from airhockey.physics import PhysicsConfig
 from airhockey.sac import ReplayBuffer, SACAgent, SACConfig
 
 
-# ── Opponent mix (must sum to 1.0) ─────────────────────────────
+# ── Steady-state league mix (Phase 3, must sum to 1.0) ─────────
 LEAGUE_TRACKER_PROB = 0.30      # passive defender
 LEAGUE_ATTACKER_PROB = 0.30     # active scorer — generates pressure
 LEAGUE_STATIONARY_PROB = 0.15
 LEAGUE_SNAPSHOT_PROB = 0.25
 
+# ── Phase 1: pure aiming curriculum (must sum to 1.0) ──────────
+PHASE1_STATIONARY_PROB = 0.80
+PHASE1_ATTACKER_PROB = 0.10
+PHASE1_TRACKER_PROB = 0.10
+PHASE1_SNAPSHOT_PROB = 0.0
+
 # Noise on the scripted opponent (training league + eval) so the agent
 # can't memorize a fixed action sequence.
 SCRIPTED_NOISE_STD = 0.05
+
+
+def phase_mix(step: int, warmup_end: int, blend_end: int) -> tuple[float, float, float, float]:
+    """Return (stationary, tracker, attacker, snapshot) probabilities
+    for the curriculum phase containing `step`.
+
+    Phase 1 (step < warmup_end): pure aiming practice mix.
+    Phase 2 (warmup_end <= step < blend_end): linear interpolation.
+    Phase 3 (step >= blend_end): steady-state league.
+    """
+    if step < warmup_end:
+        return (
+            PHASE1_STATIONARY_PROB,
+            PHASE1_TRACKER_PROB,
+            PHASE1_ATTACKER_PROB,
+            PHASE1_SNAPSHOT_PROB,
+        )
+    if step >= blend_end:
+        return (
+            LEAGUE_STATIONARY_PROB,
+            LEAGUE_TRACKER_PROB,
+            LEAGUE_ATTACKER_PROB,
+            LEAGUE_SNAPSHOT_PROB,
+        )
+    # Linear blend from Phase 1 to Phase 3.
+    t = (step - warmup_end) / max(1, blend_end - warmup_end)
+    s = (1 - t) * PHASE1_STATIONARY_PROB + t * LEAGUE_STATIONARY_PROB
+    tr = (1 - t) * PHASE1_TRACKER_PROB + t * LEAGUE_TRACKER_PROB
+    at = (1 - t) * PHASE1_ATTACKER_PROB + t * LEAGUE_ATTACKER_PROB
+    sn = (1 - t) * PHASE1_SNAPSHOT_PROB + t * LEAGUE_SNAPSHOT_PROB
+    return s, tr, at, sn
 
 
 # ── Horizontal mirroring (data augmentation) ───────────────────
@@ -91,7 +139,8 @@ class TrainArgs:
     learning_starts: int = 5_000
     update_every: int = 1
     updates_per_step: int = 1
-    opponent_warmup_steps: int = 50_000
+    curriculum_warmup_steps: int = 30_000
+    curriculum_blend_end: int = 100_000
     opponent_refresh_steps: int = 25_000
     opponent_league_size: int = 5
     eval_every_steps: int = 50_000
@@ -120,15 +169,9 @@ def main(args: TrainArgs) -> None:
         scripted_attacker, SCRIPTED_NOISE_STD, seed=args.seed + 202,
     )
 
-    # Training env. Warmup opponent is the attacker so goal events fire
-    # quickly under the pure-sparse reward; swapped to the league after.
-    env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=args.seed,
-                       opponent=noisy_attacker)
-
-    cfg = SACConfig(obs_dim=env.observation_space.shape[0],
-                    act_dim=env.action_space.shape[0])
-    agent = SACAgent(cfg, device=device)
-    buffer = ReplayBuffer(args.buffer_size, cfg.obs_dim, cfg.act_dim)
+    # Mutable container so league_opponent_fn (called inside env.step)
+    # can read the current global step for curriculum interpolation.
+    train_state = {"step": 0}
 
     opponent_league: deque = deque(maxlen=args.opponent_league_size)
     league_rng = random.Random(args.seed + 17)
@@ -142,25 +185,46 @@ def main(args: TrainArgs) -> None:
         return fn
 
     def league_opponent_fn(obs_top: np.ndarray) -> np.ndarray:
+        # Mix is curriculum-dependent on the current global step.
+        s_p, tr_p, at_p, sn_p = phase_mix(
+            train_state["step"],
+            args.curriculum_warmup_steps,
+            args.curriculum_blend_end,
+        )
+        # If no snapshot exists yet, redistribute its share to the
+        # other categories proportionally so probabilities still sum to 1.
+        if not opponent_league:
+            denom = s_p + tr_p + at_p
+            if denom > 0:
+                s_p, tr_p, at_p = s_p / denom, tr_p / denom, at_p / denom
+                sn_p = 0.0
+
         r = league_rng.random()
-        if r < LEAGUE_STATIONARY_PROB:
+        if r < s_p:
             return _stationary_opponent(obs_top)
-        if r < LEAGUE_STATIONARY_PROB + LEAGUE_TRACKER_PROB:
+        if r < s_p + tr_p:
             return noisy_tracker(obs_top)
-        if r < LEAGUE_STATIONARY_PROB + LEAGUE_TRACKER_PROB + LEAGUE_ATTACKER_PROB:
+        if r < s_p + tr_p + at_p:
             return noisy_attacker(obs_top)
+        # Snapshot bucket
         if opponent_league:
             snapshot = league_rng.choice(list(opponent_league))
             return _sampled_policy_fn(snapshot)(obs_top)
-        # Fallback before any snapshot exists.
         return noisy_attacker(obs_top)
+
+    # Training env uses the curriculum-aware league callable from step 0.
+    env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=args.seed,
+                       opponent=league_opponent_fn)
+    cfg = SACConfig(obs_dim=env.observation_space.shape[0],
+                    act_dim=env.action_space.shape[0])
+    agent = SACAgent(cfg, device=device)
+    buffer = ReplayBuffer(args.buffer_size, cfg.obs_dim, cfg.act_dim)
 
     def add_snapshot_to_league() -> None:
         snap = copy.deepcopy(agent.actor).eval()
         for p in snap.parameters():
             p.requires_grad = False
         opponent_league.append(snap)
-        env.opponent = league_opponent_fn
 
     # Output paths + CSV loggers.
     out_path = Path(args.out)
@@ -253,6 +317,7 @@ def main(args: TrainArgs) -> None:
             tqdm.write(f"[step {step}] new best checkpoint → {best_path}")
 
     for step in range(args.total_steps):
+        train_state["step"] = step
         if step < args.learning_starts:
             action = env.action_space.sample()
         else:
@@ -295,12 +360,17 @@ def main(args: TrainArgs) -> None:
                 batch = buffer.sample(args.batch_size, device)
                 latest_metrics = agent.update(batch)
 
-        if step == args.opponent_warmup_steps:
+        # Snapshots start being added once Phase 1 (pure aiming) ends.
+        if step == args.curriculum_warmup_steps:
             add_snapshot_to_league()
-            tqdm.write(f"[step {step}] switched to self-play league")
+            tqdm.write(
+                f"[step {step}] curriculum: phase 1 complete, "
+                f"snapshots enabled, blending to steady-state mix by "
+                f"step {args.curriculum_blend_end}"
+            )
         elif (
             len(opponent_league) > 0
-            and step > args.opponent_warmup_steps
+            and step > args.curriculum_warmup_steps
             and step % args.opponent_refresh_steps == 0
         ):
             add_snapshot_to_league()
