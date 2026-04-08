@@ -47,7 +47,7 @@ HF_REPO = os.environ.get("HF_REPO_ID", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 LOCAL_CKPT = "ckpt/dppo.pt"
 LOCAL_ONNX = "onnx"
-OPPONENT_CKPT = os.environ.get("AIRHOCKEY_OPPONENT_CKPT", "ckpt/sac_expert.pt")
+OPPONENT_CKPT = os.environ.get("AIRHOCKEY_OPPONENT_CKPT", "ckpt/sac_expert.best.pt")
 
 
 def download_latest_checkpoint() -> None:

@@ -27,15 +27,30 @@ from airhockey.dppo import (
     per_step_logprob,
 )
 from airhockey.env import AirHockeyEnv
+from airhockey.eval_sac import (
+    scripted_attacker,
+    scripted_tracker,
+    with_action_noise,
+)
 from airhockey.physics import PhysicsConfig
 from airhockey.policy import DiffusionPolicyConfig, NoiseScheduler, UNet1D
 from airhockey.snapshot_opponent import load_opponent
 
 
+# DPPO opponent league: a mix of the SAC expert and the scripted
+# baselines so the diffusion policy doesn't overfit to one opponent.
+# Same idea as the SAC training league.
+DPPO_LEAGUE_EXPERT = 0.50
+DPPO_LEAGUE_ATTACKER = 0.25
+DPPO_LEAGUE_TRACKER = 0.15
+DPPO_LEAGUE_STATIONARY = 0.10
+SCRIPTED_NOISE_STD = 0.05
+
+
 @dataclass
 class DPPOArgs:
     init: str = "ckpt/bc.pt"
-    opponent: str = "ckpt/sac_expert.pt"
+    opponent: str = "ckpt/sac_expert.best.pt"
     out: str = "ckpt/dppo.pt"
     total_steps: int = 2_000_000
     n_envs: int = 16
@@ -53,13 +68,45 @@ class DPPOArgs:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _stationary_opponent(_obs_top: np.ndarray) -> np.ndarray:
+    return np.zeros(2, dtype=np.float32)
+
+
+def _make_league_opponent(opponent_ckpt: str, device: str, seed: int):
+    """Build a league callable that picks a fresh opponent per call.
+
+    DPPO envs are short-lived (one chunk worth of stepping at a time)
+    so picking per-call gives the agent real opponent diversity within
+    a single rollout batch.
+    """
+    # Deterministic SAC expert here is fine — diversity comes from the
+    # scripted/attacker/stationary slots in the league, not from this one.
+    expert_fn = load_opponent(opponent_ckpt, device=device, deterministic=True)
+    noisy_tracker = with_action_noise(scripted_tracker, SCRIPTED_NOISE_STD, seed=seed + 11)
+    noisy_attacker = with_action_noise(scripted_attacker, SCRIPTED_NOISE_STD, seed=seed + 22)
+    rng = np.random.default_rng(seed + 33)
+
+    def league(obs_top: np.ndarray) -> np.ndarray:
+        r = rng.random()
+        if r < DPPO_LEAGUE_STATIONARY:
+            return _stationary_opponent(obs_top)
+        if r < DPPO_LEAGUE_STATIONARY + DPPO_LEAGUE_TRACKER:
+            return noisy_tracker(obs_top)
+        if r < DPPO_LEAGUE_STATIONARY + DPPO_LEAGUE_TRACKER + DPPO_LEAGUE_ATTACKER:
+            return noisy_attacker(obs_top)
+        return expert_fn(obs_top)
+
+    return league
+
+
 def make_envs(n: int, seed: int, opponent_ckpt: str, device: str):
-    """Build `n` envs sharing a single opponent callable."""
-    opponent_fn = load_opponent(opponent_ckpt, device=device, deterministic=True)
+    """Build `n` envs each with its own league opponent. The league
+    randomization is per-env so the rollout batch sees a mix of
+    opponents simultaneously."""
     envs = []
     for i in range(n):
         env = AirHockeyEnv(physics_config=PhysicsConfig(), seed=seed + i)
-        env.opponent = opponent_fn
+        env.opponent = _make_league_opponent(opponent_ckpt, device, seed=seed + i)
         envs.append(env)
     return envs
 
