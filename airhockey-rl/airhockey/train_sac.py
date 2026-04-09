@@ -133,20 +133,20 @@ def mirror_action(a: np.ndarray) -> np.ndarray:
 @dataclass
 class TrainArgs:
     out: str = "ckpt/sac_expert.pt"
-    total_steps: int = 1_000_000
-    batch_size: int = 256
-    buffer_size: int = 1_000_000
+    total_steps: int = 3_000_000
+    batch_size: int = 512
+    buffer_size: int = 2_000_000
     learning_starts: int = 5_000
     update_every: int = 1
-    updates_per_step: int = 1
-    curriculum_warmup_steps: int = 30_000
-    curriculum_blend_end: int = 100_000
-    opponent_refresh_steps: int = 25_000
+    updates_per_step: int = 2
+    curriculum_warmup_steps: int = 50_000
+    curriculum_blend_end: int = 200_000
+    opponent_refresh_steps: int = 50_000
     opponent_league_size: int = 5
-    demo_episodes: int = 500
-    eval_every_steps: int = 50_000
-    eval_episodes: int = 30
-    log_every_steps: int = 1_000
+    demo_episodes: int = 1000
+    eval_every_steps: int = 100_000
+    eval_episodes: int = 50
+    log_every_steps: int = 5_000
     seed: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 

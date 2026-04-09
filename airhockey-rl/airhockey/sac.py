@@ -39,6 +39,8 @@ class GaussianActor(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
         )
         self.mean = nn.Linear(hidden, act_dim)
         self.log_std = nn.Linear(hidden, act_dim)
@@ -79,6 +81,8 @@ class TwinCritic(nn.Module):
     def _build(obs_dim: int, act_dim: int, hidden: int) -> nn.Sequential:
         return nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -129,7 +133,7 @@ class ReplayBuffer:
 class SACConfig:
     obs_dim: int = 10
     act_dim: int = 2
-    hidden: int = 256
+    hidden: int = 512
     gamma: float = 0.99
     tau: float = 0.005
     actor_lr: float = 3e-4
