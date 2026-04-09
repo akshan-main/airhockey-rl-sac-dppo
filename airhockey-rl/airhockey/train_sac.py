@@ -133,12 +133,12 @@ def mirror_action(a: np.ndarray) -> np.ndarray:
 @dataclass
 class TrainArgs:
     out: str = "ckpt/sac_expert.pt"
-    total_steps: int = 3_000_000
-    batch_size: int = 512
+    total_steps: int = 2_000_000
+    batch_size: int = 256
     buffer_size: int = 2_000_000
     learning_starts: int = 5_000
     update_every: int = 1
-    updates_per_step: int = 2
+    updates_per_step: int = 1
     curriculum_warmup_steps: int = 50_000
     curriculum_blend_end: int = 200_000
     opponent_refresh_steps: int = 50_000
