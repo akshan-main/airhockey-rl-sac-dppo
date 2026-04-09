@@ -143,6 +143,7 @@ class TrainArgs:
     curriculum_blend_end: int = 100_000
     opponent_refresh_steps: int = 25_000
     opponent_league_size: int = 5
+    demo_episodes: int = 500
     eval_every_steps: int = 50_000
     eval_episodes: int = 30
     log_every_steps: int = 1_000
@@ -259,6 +260,73 @@ def main(args: TrainArgs) -> None:
 
     best_score = -float("inf")
 
+    # ── Demonstration bootstrap ────────────────────────────────
+    # Before SAC starts learning, run scripted_attacker as the bot for
+    # N episodes against a mix of opponents and push every transition
+    # into the replay buffer. This gives the critic positive examples
+    # of "approach still puck → hit → score," which random exploration
+    # cannot reliably produce against a stationary opponent.
+    if args.demo_episodes > 0:
+        # Demo opponent mix heavily weighted toward stationary (the
+        # scenario random exploration cannot crack) but with some
+        # tracker/attacker for coverage of moving-opponent dynamics.
+        demo_rng = random.Random(args.seed + 333)
+
+        def pick_demo_opponent():
+            r = demo_rng.random()
+            if r < 0.5:
+                return _stationary_opponent
+            if r < 0.8:
+                return noisy_tracker
+            return noisy_attacker
+
+        # Demos run under pure sparse reward — the time/idle penalties
+        # would make scripted_attacker's draws look terrible and push
+        # negative examples into the buffer. Flip them off during demos.
+        saved_time = env.reward_time_coef
+        saved_idle = env.reward_idle_coef
+        saved_shaping = env.shaping_enabled
+        env.reward_time_coef = 0.0
+        env.reward_idle_coef = 0.0
+        env.shaping_enabled = False
+
+        demo_wins = demo_losses = demo_draws = demo_transitions = 0
+        for ep in tqdm(range(args.demo_episodes), desc="Demos"):
+            env.opponent = pick_demo_opponent()
+            obs_d, _ = env.reset(seed=args.seed + 50_000 + ep)
+            last_event = ""
+            while True:
+                action_d = scripted_attacker(obs_d.astype(np.float32))
+                next_obs_d, rew_d, term_d, trunc_d, info_d = env.step(action_d)
+                done_d = bool(term_d)
+                buffer.push(obs_d, action_d, rew_d, next_obs_d, done_d)
+                buffer.push(
+                    mirror_obs(obs_d), mirror_action(action_d),
+                    rew_d, mirror_obs(next_obs_d), done_d,
+                )
+                demo_transitions += 2
+                evt = info_d.get("event", "")
+                if evt.startswith("goal"):
+                    last_event = evt
+                obs_d = next_obs_d
+                if term_d or trunc_d:
+                    break
+            if last_event == "goal_bot":
+                demo_wins += 1
+            elif last_event == "goal_top":
+                demo_losses += 1
+            else:
+                demo_draws += 1
+
+        env.reward_time_coef = saved_time
+        env.reward_idle_coef = saved_idle
+        env.shaping_enabled = saved_shaping
+        print(
+            f"Demos: {demo_wins}W / {demo_losses}L / {demo_draws}D, "
+            f"{demo_transitions:,} transitions pushed to buffer "
+            f"(buffer now {buffer.size:,}/{buffer.capacity:,})"
+        )
+
     obs, _ = env.reset(seed=args.seed)
     ep_return = 0.0
     ep_length = 0
@@ -320,9 +388,13 @@ def main(args: TrainArgs) -> None:
             torch.save(agent.state_dict(), best_path)
             tqdm.write(f"[step {step}] new best checkpoint → {best_path}")
 
+    # Skip the random-exploration phase if demos already populated the
+    # buffer — we have real transitions to learn from now.
+    effective_learning_starts = 0 if args.demo_episodes > 0 else args.learning_starts
+
     for step in range(args.total_steps):
         train_state["step"] = step
-        if step < args.learning_starts:
+        if step < effective_learning_starts:
             action = env.action_space.sample()
         else:
             action = agent.act(obs, deterministic=False)
@@ -359,7 +431,7 @@ def main(args: TrainArgs) -> None:
         else:
             obs = next_obs
 
-        if step >= args.learning_starts and step % args.update_every == 0:
+        if step >= effective_learning_starts and step % args.update_every == 0:
             for _ in range(args.updates_per_step):
                 batch = buffer.sample(args.batch_size, device)
                 latest_metrics = agent.update(batch)
@@ -403,7 +475,7 @@ def main(args: TrainArgs) -> None:
 
         if (
             args.eval_every_steps > 0
-            and step >= args.learning_starts
+            and step >= effective_learning_starts
             and (step + 1) % args.eval_every_steps == 0
         ):
             do_eval(step + 1)
