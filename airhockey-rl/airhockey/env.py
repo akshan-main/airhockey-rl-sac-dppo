@@ -55,10 +55,7 @@ class AirHockeyEnv(gym.Env):
         reward_concede: float = -10.0,
         reward_strike_coef: float = 0.5,
         reward_lateral_coef: float = 0.3,
-        reward_time_coef: float = 0.0,
-        reward_idle_coef: float = 0.0,
-        idle_puck_speed_threshold: float = 30.0,
-        idle_grace_steps: int = 20,
+        reward_dist_coef: float = 0.05,
         max_episode_steps: int = 800,
         seed: int = 0,
     ):
@@ -69,14 +66,10 @@ class AirHockeyEnv(gym.Env):
         self.reward_concede = reward_concede
         self.reward_strike_coef = reward_strike_coef
         self.reward_lateral_coef = reward_lateral_coef
-        self.reward_time_coef = reward_time_coef
-        self.reward_idle_coef = reward_idle_coef
-        self.idle_puck_speed_threshold = idle_puck_speed_threshold
-        self.idle_grace_steps = idle_grace_steps
+        self.reward_dist_coef = reward_dist_coef
         self.shaping_enabled = False  # train_sac.py flips this on/off
         self.max_episode_steps = max_episode_steps
         self._step_count = 0
-        self._idle_streak = 0
 
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(10,), dtype=np.float32
@@ -174,21 +167,7 @@ class AirHockeyEnv(gym.Env):
         serve = "bot" if self.physics.rng.random() < 0.5 else "top"
         self.physics.hard_reset(serve_to=serve)
 
-        # Random non-home start positions for both paddles. Real players
-        # are rarely on the central line at the start of a rally; if the
-        # agent always starts dead-center, the shortest path to the puck
-        # is always head-on, which produces straight shots into the
-        # opponent's center. Off-center starts force the agent to learn
-        # that being off-axis is normal.
-        s = self.physics.state
-        rng = self.physics.rng
-        s.bot_x = float(rng.uniform(self.physics.paddle_min_x, self.physics.paddle_max_x))
-        s.bot_y = float(rng.uniform(self.physics.bot_min_y, self.physics.bot_max_y))
-        s.top_x = float(rng.uniform(self.physics.paddle_min_x, self.physics.paddle_max_x))
-        s.top_y = float(rng.uniform(self.physics.top_min_y, self.physics.top_max_y))
-
         self._step_count = 0
-        self._idle_streak = 0
         obs = self.physics.get_obs(perspective="bot")
         return obs, {}
 
@@ -256,31 +235,17 @@ class AirHockeyEnv(gym.Env):
                     lateral = abs(pre_bot_vx) / pc.max_paddle_speed
                     reward += self.reward_lateral_coef * lateral
 
-        # Time pressure: small negative reward every step. Accumulates to
-        # -4 over a full 800-step episode, which is enough to make
-        # drawing-forever strictly worse than trying-and-sometimes-losing.
-        # Active regardless of curriculum phase — we want the final
-        # policy to be impatient too.
-        if self.reward_time_coef > 0.0:
-            reward -= self.reward_time_coef
-
-        # Idle-puck penalty: the policy's failure mode on stationary
-        # opponents is "do nothing because nothing is happening." If the
-        # puck has been barely moving for idle_grace_steps in a row,
-        # start charging an escalating penalty so the agent has a hard
-        # gradient pushing it to go *make* something happen. Counter
-        # resets as soon as the puck moves again (and always on a hit
-        # or a goal).
-        puck_speed = float(
-            np.hypot(self.physics.state.puck_vx, self.physics.state.puck_vy)
-        )
-        if puck_speed < self.idle_puck_speed_threshold:
-            self._idle_streak += 1
-        else:
-            self._idle_streak = 0
-        if self.reward_idle_coef > 0.0 and self._idle_streak > self.idle_grace_steps:
-            over = self._idle_streak - self.idle_grace_steps
-            reward -= self.reward_idle_coef * over / 100.0
+        # Distance-to-puck shaping (always on). Gives the critic a
+        # gradient from "far from puck" to "near the puck." Without
+        # this, the critic sees Q ≈ constant everywhere and the actor
+        # drifts to walls. This is potential-based shaping: the reward
+        # is a function of the current state only, so it doesn't
+        # change the optimal policy — it only speeds up learning.
+        if self.reward_dist_coef > 0.0 and not terminated:
+            ps = self.physics.state
+            dist = float(np.hypot(ps.puck_x - ps.bot_x, ps.puck_y - ps.bot_y))
+            max_dist = float(np.hypot(self.physics.cfg.width, self.physics.cfg.height))
+            reward -= self.reward_dist_coef * dist / max_dist
 
         truncated = self._step_count >= self.max_episode_steps
         obs = self.physics.get_obs(perspective="bot")

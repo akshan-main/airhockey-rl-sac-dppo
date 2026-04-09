@@ -260,16 +260,15 @@ def main(args: TrainArgs) -> None:
 
     best_score = -float("inf")
 
-    # ── Demonstration bootstrap ────────────────────────────────
-    # Before SAC starts learning, run scripted_attacker as the bot for
-    # N episodes against a mix of opponents and push every transition
-    # into the replay buffer. This gives the critic positive examples
-    # of "approach still puck → hit → score," which random exploration
-    # cannot reliably produce against a stationary opponent.
+    # ── Demonstration bootstrap (SACfD) ──────────────────────────
+    # Persistent demo buffer that never gets overwritten. 25% of every
+    # training batch is sampled from here so the critic always sees
+    # scripted_attacker's "approach puck → aim → score" transitions,
+    # even when the online buffer has millions of the agent's own
+    # (potentially degenerate) transitions.
+    demo_buffer = ReplayBuffer(500_000, cfg.obs_dim, cfg.act_dim)
+
     if args.demo_episodes > 0:
-        # Demo opponent mix heavily weighted toward stationary (the
-        # scenario random exploration cannot crack) but with some
-        # tracker/attacker for coverage of moving-opponent dynamics.
         demo_rng = random.Random(args.seed + 333)
 
         def pick_demo_opponent():
@@ -280,14 +279,7 @@ def main(args: TrainArgs) -> None:
                 return noisy_tracker
             return noisy_attacker
 
-        # Demos run under pure sparse reward — the time/idle penalties
-        # would make scripted_attacker's draws look terrible and push
-        # negative examples into the buffer. Flip them off during demos.
-        saved_time = env.reward_time_coef
-        saved_idle = env.reward_idle_coef
         saved_shaping = env.shaping_enabled
-        env.reward_time_coef = 0.0
-        env.reward_idle_coef = 0.0
         env.shaping_enabled = False
 
         demo_wins = demo_losses = demo_draws = demo_transitions = 0
@@ -299,8 +291,9 @@ def main(args: TrainArgs) -> None:
                 action_d = scripted_attacker(obs_d.astype(np.float32))
                 next_obs_d, rew_d, term_d, trunc_d, info_d = env.step(action_d)
                 done_d = bool(term_d)
-                buffer.push(obs_d, action_d, rew_d, next_obs_d, done_d)
-                buffer.push(
+                # Demos go into the persistent demo_buffer only.
+                demo_buffer.push(obs_d, action_d, rew_d, next_obs_d, done_d)
+                demo_buffer.push(
                     mirror_obs(obs_d), mirror_action(action_d),
                     rew_d, mirror_obs(next_obs_d), done_d,
                 )
@@ -318,14 +311,36 @@ def main(args: TrainArgs) -> None:
             else:
                 demo_draws += 1
 
-        env.reward_time_coef = saved_time
-        env.reward_idle_coef = saved_idle
         env.shaping_enabled = saved_shaping
         print(
             f"Demos: {demo_wins}W / {demo_losses}L / {demo_draws}D, "
-            f"{demo_transitions:,} transitions pushed to buffer "
-            f"(buffer now {buffer.size:,}/{buffer.capacity:,})"
+            f"{demo_transitions:,} transitions in demo buffer"
         )
+
+    # ── Pre-train actor via BC on demos ─────────────────────────
+    # The actor starts from random weights, which in practice means
+    # "go to the corner." A few hundred BC steps on the demo buffer
+    # initializes the actor to "go to the puck and hit it," which is
+    # what scripted_attacker does. SAC then refines from there.
+    if demo_buffer.size > 0:
+        bc_optim = torch.optim.Adam(agent.actor.parameters(), lr=1e-3)
+        BC_STEPS = 500
+        BC_BATCH = min(512, demo_buffer.size)
+        agent.actor.train()
+        for _ in tqdm(range(BC_STEPS), desc="BC pre-train"):
+            idx = np.random.randint(0, demo_buffer.size, size=BC_BATCH)
+            obs_bc = torch.from_numpy(demo_buffer.obs[idx]).to(device)
+            act_bc = torch.from_numpy(demo_buffer.act[idx]).to(device)
+            mean, _ = agent.actor(obs_bc)
+            pred = torch.tanh(mean)
+            loss = torch.nn.functional.mse_loss(pred, act_bc)
+            bc_optim.zero_grad()
+            loss.backward()
+            bc_optim.step()
+        print(f"BC pre-train done, final loss={loss.item():.4f}")
+        # Restore the main actor optimizer state (BC used a separate one
+        # with higher LR so we don't pollute SAC's momentum).
+        agent.opt_actor = torch.optim.Adam(agent.actor.parameters(), lr=cfg.actor_lr)
 
     obs, _ = env.reset(seed=args.seed)
     ep_return = 0.0
@@ -433,7 +448,12 @@ def main(args: TrainArgs) -> None:
 
         if step >= effective_learning_starts and step % args.update_every == 0:
             for _ in range(args.updates_per_step):
-                batch = buffer.sample(args.batch_size, device)
+                if demo_buffer.size > 0:
+                    batch = buffer.sample_mixed(
+                        args.batch_size, device, demo_buffer, demo_fraction=0.25,
+                    )
+                else:
+                    batch = buffer.sample(args.batch_size, device)
                 latest_metrics = agent.update(batch)
 
         # Snapshots start being added once Phase 1 (pure aiming) ends.

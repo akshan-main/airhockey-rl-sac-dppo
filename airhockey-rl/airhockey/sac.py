@@ -123,6 +123,33 @@ class ReplayBuffer:
             torch.from_numpy(self.done[idx]).to(device),
         )
 
+    def sample_mixed(
+        self,
+        batch: int,
+        device: torch.device,
+        demo_buffer: "ReplayBuffer",
+        demo_fraction: float = 0.25,
+    ):
+        """Sample a batch that's `demo_fraction` from a persistent demo
+        buffer and the rest from this (online) buffer. This prevents
+        demo transitions from being diluted as the online buffer grows,
+        which is the SACfD trick (Vecerik et al. 2017)."""
+        n_demo = min(int(batch * demo_fraction), demo_buffer.size)
+        n_online = batch - n_demo
+        d_idx = np.random.randint(0, demo_buffer.size, size=n_demo)
+        o_idx = np.random.randint(0, self.size, size=n_online)
+        def cat(arr_online, arr_demo):
+            return torch.from_numpy(
+                np.concatenate([arr_online[o_idx], arr_demo[d_idx]], axis=0)
+            ).to(device)
+        return (
+            cat(self.obs, demo_buffer.obs),
+            cat(self.act, demo_buffer.act),
+            cat(self.rew, demo_buffer.rew),
+            cat(self.next_obs, demo_buffer.next_obs),
+            cat(self.done, demo_buffer.done),
+        )
+
 
 # ── SAC agent ─────────────────────────────────────────────────
 @dataclass
