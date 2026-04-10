@@ -84,8 +84,6 @@ class AirHockeyPhysics:
     def reset(self, serve_to: Literal["top", "bot"] = "top") -> None:
         c = self.cfg
         s = self.state
-        # Puck serves with a random x-offset so the agent can't exploit a
-        # fixed starting trajectory.
         x_jitter = float(self.rng.uniform(-40.0, 40.0))
         s.puck_x = c.width / 2 + x_jitter
         s.puck_y = c.height * (0.30 if serve_to == "top" else 0.70)

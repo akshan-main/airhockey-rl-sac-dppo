@@ -70,6 +70,7 @@ class AirHockeyEnv(gym.Env):
         self.shaping_enabled = False  # train_sac.py flips this on/off
         self.max_episode_steps = max_episode_steps
         self._step_count = 0
+        self._last_scorer = ""  # "goal_bot" or "goal_top" from the previous episode
 
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(10,), dtype=np.float32
@@ -162,9 +163,17 @@ class AirHockeyEnv(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self.physics.rng = np.random.default_rng(seed)
-        # Randomize which side serves so the agent can't condition on
-        # "always get first strike".
-        serve = "bot" if self.physics.rng.random() < 0.5 else "top"
+        # First serve is random. After a goal, the scored-on side serves
+        # (puck placed on their half). This is tracked by _last_scorer.
+        if self._last_scorer == "":
+            serve = "bot" if self.physics.rng.random() < 0.5 else "top"
+        elif self._last_scorer == "goal_bot":
+            # Bot scored → top was scored on → top serves
+            serve = "top"
+        else:
+            # Top scored → bot was scored on → bot serves
+            serve = "bot"
+        self._last_scorer = ""
         self.physics.hard_reset(serve_to=serve)
 
         self._step_count = 0
@@ -194,9 +203,11 @@ class AirHockeyEnv(gym.Env):
         if event == "goal_bot":
             reward = self.reward_score
             terminated = True
+            self._last_scorer = "goal_bot"
         elif event == "goal_top":
             reward = self.reward_concede
             terminated = True
+            self._last_scorer = "goal_top"
 
         # Curriculum strike shaping. Phase 1 only. Two parts:
         #
