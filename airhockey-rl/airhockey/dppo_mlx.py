@@ -179,7 +179,7 @@ def dppo_update(
     for _ in range(n_epochs):
         perm = np.random.permutation(B)
         for start in range(0, B, minibatch):
-            mb = perm[start:start + minibatch]
+            mb = mx.array(perm[start:start + minibatch])
             mb_obs = obs[mb]
             mb_curr = chains_curr[mb]
             mb_next = chains_next[mb]
@@ -193,7 +193,7 @@ def dppo_update(
             )
             optim_actor.update(model, actor_grads)
 
-            (c_loss,), critic_grads = critic_loss_grad(critic, mb_obs, mb_ret)
+            c_loss, critic_grads = critic_loss_grad(critic, mb_obs, mb_ret)
             optim_critic.update(critic, critic_grads)
 
             mx.eval(model.parameters(), critic.parameters(),
