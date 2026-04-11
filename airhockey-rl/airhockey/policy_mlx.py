@@ -180,14 +180,64 @@ def convert_torch_to_mlx(torch_state: dict, cfg: DiffusionPolicyConfig) -> dict:
     return mlx_params
 
 
+def _flatten_dict(d, prefix=""):
+    """Flatten a nested dict into dot-separated keys."""
+    items = {}
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            items.update(_flatten_dict(v, key))
+        elif isinstance(v, mx.array):
+            items[key] = v
+        elif isinstance(v, list):
+            for i, item in enumerate(v):
+                if isinstance(item, dict):
+                    items.update(_flatten_dict(item, f"{key}.{i}"))
+                elif isinstance(item, mx.array):
+                    items[f"{key}.{i}"] = item
+    return items
+
+
 def convert_mlx_to_torch(mlx_params: dict) -> dict:
-    """Convert MLX parameters back to PyTorch state_dict format."""
+    """Convert MLX parameters back to PyTorch state_dict format.
+
+    Handles the key name mapping between MLX and PyTorch architectures:
+    - MLX Conv1dBlock has .conv and .norm; PyTorch has .block.0 and .block.1
+    - MLX ResidualBlock has .cond_linear; PyTorch has .cond_mlp.1
+    - MLX UNet1D has .time_emb_l1/l2, .obs_emb_l1/l2, .out_conv;
+      PyTorch has .time_emb.1/.3, .obs_emb.0/.2, .out
+    """
     import torch
     import numpy as np
+    flat = _flatten_dict(mlx_params)
+
+    # Build the key mapping from MLX names to PyTorch names
+    KEY_MAP = {
+        "time_emb_l1": "time_emb.1",
+        "time_emb_l2": "time_emb.3",
+        "obs_emb_l1": "obs_emb.0",
+        "obs_emb_l2": "obs_emb.2",
+        "out_conv": "out",
+        "cond_linear": "cond_mlp.1",
+    }
+    # Conv1dBlock: .conv → .block.0, .norm → .block.1
+    BLOCK_MAP = {
+        ".conv.": ".block.0.",
+        ".norm.": ".block.1.",
+    }
+
     torch_state = {}
-    for k, v in mlx_params.items():
+    for k, v in flat.items():
+        tk = k
+        # Apply key mappings
+        for mlx_name, torch_name in KEY_MAP.items():
+            tk = tk.replace(mlx_name, torch_name)
+        for mlx_pat, torch_pat in BLOCK_MAP.items():
+            tk = tk.replace(mlx_pat, torch_pat)
+
         arr = np.array(v)
-        if "conv" in k.lower() and "weight" in k and arr.ndim == 3:
+        # Conv1d weight: MLX (out, K, in) → PyTorch (out, in, K)
+        if "weight" in tk and arr.ndim == 3:
             arr = arr.transpose(0, 2, 1)
-        torch_state[k] = torch.from_numpy(arr)
+        torch_state[tk] = torch.from_numpy(arr.copy())
     return torch_state

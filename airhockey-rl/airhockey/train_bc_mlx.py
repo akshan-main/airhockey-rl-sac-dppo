@@ -136,8 +136,7 @@ def train(
     # Save as PyTorch checkpoint for compatibility with downstream stages
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    mlx_weights = dict(nn.Module.parameters(model))
-    torch_state = convert_mlx_to_torch(mlx_weights)
+    torch_state = convert_mlx_to_torch(model.parameters())
     import torch
     torch.save(
         {"model": torch_state, "config": cfg.__dict__},
