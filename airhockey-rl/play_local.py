@@ -1,23 +1,17 @@
-"""Play against the SAC agent locally with pygame.
+"""Play against the scripted attacker locally with pygame.
 
-You control the BOTTOM paddle with your mouse.
-The SAC agent controls the TOP paddle.
+You control the BOTTOM paddle with your mouse (click + drag).
+The scripted attacker controls the TOP paddle.
 
 Usage:
-    python play_local.py                          # uses best checkpoint
-    python play_local.py --ckpt ckpt/sac_expert.pt  # specific checkpoint
+    python play_local.py
 """
-import argparse
-import sys
-
 import numpy as np
 import pygame
-import torch
 
 from airhockey.env import AirHockeyEnv
 from airhockey.eval_sac import scripted_attacker
 from airhockey.physics import PhysicsConfig
-from airhockey.sac import SACAgent, SACConfig
 
 # ── Colors ───────────────────────────────────────────────────
 BG = (30, 30, 40)
@@ -34,18 +28,6 @@ FPS = 50
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", default="ckpt/sac_expert.best.pt")
-    p.add_argument("--device", default="cpu")
-    args = p.parse_args()
-
-    # Load SAC agent (plays as TOP paddle via mirrored obs).
-    device = torch.device(args.device)
-    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    cfg = SACConfig(**ckpt["config"])
-    agent = SACAgent(cfg, device=device)
-    agent.load_state_dict(ckpt)
-    agent.actor.eval()
 
     # Higher paddle speed/accel caps than training so the human paddle
     # feels responsive. The AI opponent uses the same caps (fair fight).

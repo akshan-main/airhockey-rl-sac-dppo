@@ -1,7 +1,8 @@
 """load_opponent(ckpt_path) -> (obs -> action) callable.
 
-Auto-detects SAC vs Diffusion Policy checkpoints by inspecting the saved
-state dict keys and returns a callable that matches env.OpponentFn.
+Auto-detects SAC vs Diffusion Policy checkpoints. For diffusion
+policies, checks for the 'normalizer' key — new MLX-trained checkpoints
+have it, legacy Conv1d-UNet checkpoints don't.
 """
 from __future__ import annotations
 
@@ -11,7 +12,6 @@ from typing import Callable
 import numpy as np
 import torch
 
-from airhockey.policy import DiffusionPolicyConfig, NoiseScheduler, UNet1D
 from airhockey.sac import SACAgent, SACConfig
 
 
@@ -22,8 +22,13 @@ def _is_sac_checkpoint(ckpt: dict) -> bool:
     return "actor" in ckpt and "critic" in ckpt and "log_alpha" in ckpt
 
 
-def _is_diffusion_checkpoint(ckpt: dict) -> bool:
-    return "model" in ckpt and "config" in ckpt and isinstance(ckpt["config"], dict)
+def _is_mlx_diffusion_checkpoint(ckpt: dict) -> bool:
+    return "model" in ckpt and "config" in ckpt and "normalizer" in ckpt
+
+
+def _is_legacy_diffusion_checkpoint(ckpt: dict) -> bool:
+    return ("model" in ckpt and "config" in ckpt
+            and "normalizer" not in ckpt)
 
 
 def load_opponent(
@@ -33,6 +38,9 @@ def load_opponent(
 ) -> OpponentFn:
     """Load a SAC or Diffusion Policy checkpoint and return an OpponentFn."""
     device = torch.device(device)
+    # weights_only=False is required because our checkpoints contain
+    # dicts (config, normalizer). Only load from trusted paths (our
+    # own ckpt directory, not user-uploaded files).
     ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
 
     if _is_sac_checkpoint(ckpt):
@@ -46,21 +54,31 @@ def load_opponent(
 
         return sac_opponent
 
-    if _is_diffusion_checkpoint(ckpt):
+    if _is_mlx_diffusion_checkpoint(ckpt):
+        # New MLX diffusion policy (MLP + FiLM + cosine schedule + normalizer)
+        from airhockey.policy_mlx import load_diffusion_policy, diffusion_act
+        model, scheduler, normalizer, cfg = load_diffusion_policy(str(ckpt_path))
+
+        def diffusion_opponent(obs_top: np.ndarray) -> np.ndarray:
+            return diffusion_act(model, scheduler, normalizer, obs_top)
+
+        return diffusion_opponent
+
+    if _is_legacy_diffusion_checkpoint(ckpt):
+        # Legacy Conv1d UNet diffusion policy (no normalizer, older format)
+        from airhockey.policy import DiffusionPolicyConfig, NoiseScheduler, UNet1D
         cfg = DiffusionPolicyConfig(**ckpt["config"])
         model = UNet1D(cfg).to(device).eval()
         model.load_state_dict(ckpt["model"])
         scheduler = NoiseScheduler(cfg, device=device)
 
-        # Samples a fresh chunk per call and returns the first action.
-        # Does K UNet forwards per env step — only used for eval.
         @torch.no_grad()
-        def diffusion_opponent(obs_top: np.ndarray) -> np.ndarray:
+        def legacy_diffusion_opponent(obs_top: np.ndarray) -> np.ndarray:
             obs_t = torch.from_numpy(obs_top.astype(np.float32)).unsqueeze(0).to(device)
             chunk = scheduler.ddim_sample(model, obs_t, n_steps=cfg.n_inference_steps)
             return chunk[0, 0].cpu().numpy()
 
-        return diffusion_opponent
+        return legacy_diffusion_opponent
 
     raise ValueError(
         f"Unrecognized checkpoint format at {ckpt_path}. "

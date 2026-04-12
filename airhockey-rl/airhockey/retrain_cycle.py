@@ -161,8 +161,8 @@ def main() -> None:
 
     if len(win_obs) < 128:
         print("Not enough winning data to update meaningfully. Skipping.")
-        for k in keys:
-            store.mark_processed(k)
+        # Do NOT mark shards as processed — they accumulate across
+        # cycles until there's enough winning data to train on.
         return
 
     obs_t = torch.from_numpy(win_obs).to(device)

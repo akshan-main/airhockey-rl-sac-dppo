@@ -1,8 +1,12 @@
-"""Diffusion Policy in MLX — mirrors policy.py (PyTorch) exactly.
+"""Diffusion Policy in MLX — MLP architecture with cosine schedule.
 
-Same architecture, same shapes, same hyperparameters. The only
-difference is the framework. Checkpoints convert at boundaries via
-convert_torch_to_mlx() / convert_mlx_to_torch().
+Matches the official irom-princeton/dppo implementation:
+  - DiffusionMLP (not Conv1d UNet) for state-based tasks
+  - Cosine beta schedule (not linear)
+  - Standard DDPM epsilon-prediction loss
+  - DDIM sampling for inference
+
+Checkpoints convert between MLX and PyTorch at save/load boundaries.
 """
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 @dataclass
@@ -18,14 +23,25 @@ class DiffusionPolicyConfig:
     obs_dim: int = 10
     act_dim: int = 2
     horizon: int = 8
-    hidden: int = 128
-    obs_embed_dim: int = 64
+    hidden: int = 256
+    n_layers: int = 3
+    time_dim: int = 32
     n_train_diffusion_steps: int = 100
     n_inference_steps: int = 10
-    beta_start: float = 1e-4
-    beta_end: float = 0.02
+    ema_decay: float = 0.995
 
 
+# ── Cosine beta schedule (Nichol & Dhariwal 2021) ─────────────
+def cosine_beta_schedule(timesteps: int, s: float = 0.008):
+    steps = timesteps + 1
+    x = np.linspace(0, timesteps, steps)
+    alphas_cumprod = np.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return np.clip(betas, 0, 0.999).astype(np.float32)
+
+
+# ── Sinusoidal time embedding ─────────────────────────────────
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -39,119 +55,120 @@ class SinusoidalPosEmb(nn.Module):
         return mx.concatenate([mx.sin(emb), mx.cos(emb)], axis=-1)
 
 
-class Conv1dBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, kernel: int = 3):
-        super().__init__()
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel, padding=kernel // 2)
-        self.norm = nn.GroupNorm(8, out_ch)
+# ── Diffusion MLP with FiLM conditioning (state-based) ───────
+class DiffusionMLP(nn.Module):
+    """MLP noise predictor with FiLM (scale+bias) conditioning from
+    time embedding and obs. Matches Chi et al. cond_predict_scale=True.
 
-    def __call__(self, x: mx.array) -> mx.array:
-        # MLX Conv1d expects (B, L, C), same as our (B, H, ch)
-        x = self.conv(x)
-        # GroupNorm expects (B, ..., C) — MLX handles this
-        x = self.norm(x)
-        x = nn.mish(x)
-        return x
+    Input: flattened action chunk (B, H*A), time t, obs
+    Output: predicted noise (B, H, A)
 
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, cond_dim: int):
-        super().__init__()
-        self.block1 = Conv1dBlock(in_ch, out_ch)
-        self.block2 = Conv1dBlock(out_ch, out_ch)
-        self.cond_linear = nn.Linear(cond_dim, out_ch)
-        self.skip = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-
-    def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
-        h = self.block1(x)
-        c = nn.mish(cond)
-        c = self.cond_linear(c)[:, None, :]  # (B, 1, out_ch)
-        h = h + c
-        h = self.block2(h)
-        skip = self.skip(x) if self.skip is not None else x
-        return h + skip
-
-
-class UNet1D(nn.Module):
+    Each hidden layer is modulated by an affine transform derived
+    from (time_emb, obs): h <- scale * h + bias, where scale/bias
+    are learned linear projections of the concatenated conditioning.
+    This is strictly more expressive than additive concatenation.
+    """
     def __init__(self, cfg: DiffusionPolicyConfig):
         super().__init__()
         self.cfg = cfg
-        H, A, D = cfg.horizon, cfg.act_dim, cfg.hidden
+        H, A = cfg.horizon, cfg.act_dim
+        input_dim = H * A
+        time_dim = cfg.time_dim
+        cond_dim = cfg.obs_dim
+        hidden = cfg.hidden
+        n_layers = cfg.n_layers
 
-        self.time_emb_sin = SinusoidalPosEmb(D)
-        self.time_emb_l1 = nn.Linear(D, D * 2)
-        self.time_emb_l2 = nn.Linear(D * 2, D)
+        # Time embedding
+        self.time_emb = SinusoidalPosEmb(time_dim)
+        self.time_mlp1 = nn.Linear(time_dim, time_dim * 4)
+        self.time_mlp2 = nn.Linear(time_dim * 4, time_dim)
 
-        self.obs_emb_l1 = nn.Linear(cfg.obs_dim, cfg.obs_embed_dim)
-        self.obs_emb_l2 = nn.Linear(cfg.obs_embed_dim, D)
+        # Conditioning encoder: (time_dim + obs_dim) -> conditioning vec
+        self.cond_encoder = nn.Linear(time_dim + cond_dim, hidden)
 
-        cond_dim = D
-        self.down1 = ResidualBlock(A, D, cond_dim)
-        self.down2 = ResidualBlock(D, D * 2, cond_dim)
-        self.mid = ResidualBlock(D * 2, D * 2, cond_dim)
-        self.up2 = ResidualBlock(D * 4, D, cond_dim)
-        self.up1 = ResidualBlock(D * 2, D, cond_dim)
-        self.out_conv = nn.Conv1d(D, A, 1)
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden)
+
+        # FiLM layers: each produces (scale, bias) per hidden unit
+        self.layers = [nn.Linear(hidden, hidden) for _ in range(n_layers)]
+        self.film_layers = [nn.Linear(hidden, 2 * hidden) for _ in range(n_layers)]
+
+        # Output projection
+        self.output_proj = nn.Linear(hidden, input_dim)
 
     def __call__(self, a: mx.array, t: mx.array, obs: mx.array) -> mx.array:
-        """a: (B,H,A), t: (B,), obs: (B,O) → noise pred (B,H,A)"""
+        B = a.shape[0]
+        a_flat = a.reshape(B, -1)
+
         # Time embedding
-        te = self.time_emb_sin(t)
-        te = nn.mish(self.time_emb_l1(te))
-        te = self.time_emb_l2(te)
-        # Obs embedding
-        oe = nn.mish(self.obs_emb_l1(obs))
-        oe = self.obs_emb_l2(oe)
-        cond = te + oe
+        te = self.time_emb(t)
+        te = nn.mish(self.time_mlp1(te))
+        te = self.time_mlp2(te)
 
-        # MLX Conv1d: (B, L, C) — a is already (B, H, A) which is (B, L, C)
-        x = a
-        d1 = self.down1(x, cond)
-        d2 = self.down2(d1, cond)
-        m = self.mid(d2, cond)
-        u2 = self.up2(mx.concatenate([m, d2], axis=-1), cond)
-        u1 = self.up1(mx.concatenate([u2, d1], axis=-1), cond)
-        out = self.out_conv(u1)
-        return out
+        # Conditioning = concat(time_emb, obs)
+        cond = mx.concatenate([te, obs], axis=-1)
+        cond = nn.mish(self.cond_encoder(cond))  # (B, hidden)
+
+        # Input projection
+        h = nn.mish(self.input_proj(a_flat))
+
+        # FiLM-modulated residual MLP
+        for layer, film in zip(self.layers, self.film_layers):
+            h_in = h
+            h = layer(h)
+            # FiLM: split film output into scale and bias
+            sb = film(cond)
+            scale = sb[:, :self.cfg.hidden]
+            bias = sb[:, self.cfg.hidden:]
+            h = (1.0 + scale) * h + bias
+            h = nn.mish(h)
+            h = h + h_in  # residual
+
+        out = self.output_proj(h)
+        return out.reshape(B, self.cfg.horizon, self.cfg.act_dim)
 
 
+# ── Noise scheduler with cosine schedule ──────────────────────
 class NoiseScheduler:
     def __init__(self, cfg: DiffusionPolicyConfig):
         T = cfg.n_train_diffusion_steps
-        betas = mx.linspace(cfg.beta_start, cfg.beta_end, T)
+        betas = cosine_beta_schedule(T)
         alphas = 1.0 - betas
-        alpha_bars = mx.cumprod(alphas)
+        alpha_bars = np.cumprod(alphas)
         self.cfg = cfg
-        self.betas = betas
-        self.alphas = alphas
-        self.alpha_bars = alpha_bars
+        self.betas = mx.array(betas)
+        self.alphas = mx.array(alphas)
+        self.alpha_bars = mx.array(alpha_bars)
 
     def add_noise(self, a0: mx.array, t: mx.array, noise: mx.array) -> mx.array:
         ab = self.alpha_bars[t].reshape(-1, 1, 1)
         return a0 * mx.sqrt(ab) + noise * mx.sqrt(1.0 - ab)
 
-    def ddim_sample(self, model: UNet1D, obs: mx.array,
+    def ddim_sample(self, model, obs: mx.array,
                     n_steps: int | None = None) -> mx.array:
         cfg = self.cfg
         n_steps = n_steps or cfg.n_inference_steps
         T = cfg.n_train_diffusion_steps
-        ts = mx.linspace(T - 1, 0, n_steps + 1).astype(mx.int32)
+        ts = [int(round(x)) for x in np.linspace(T - 1, 0, n_steps + 1)]
         B = obs.shape[0]
         a = mx.random.normal((B, cfg.horizon, cfg.act_dim))
         for i in range(n_steps):
-            t_now = int(ts[i].item())
-            t_next = int(ts[i + 1].item())
+            t_now = ts[i]
+            t_next = ts[i + 1]
             t_batch = mx.full((B,), t_now, dtype=mx.int32)
             eps = model(a, t_batch, obs)
-            ab_now = self.alpha_bars[t_now]
-            ab_next = self.alpha_bars[t_next] if t_next >= 0 else mx.array(1.0)
-            a0_pred = (a - mx.sqrt(1.0 - ab_now) * eps) / mx.sqrt(ab_now)
-            a0_pred = mx.clip(a0_pred, -1.5, 1.5)
-            a = mx.sqrt(ab_next) * a0_pred + mx.sqrt(1.0 - ab_next) * eps
-        return mx.clip(a, -1.0, 1.0)
+            ab_now = float(self.alpha_bars[t_now].item())
+            ab_next = float(self.alpha_bars[t_next].item()) if t_next >= 0 else 1.0
+            a0_pred = (a - math.sqrt(1.0 - ab_now) * eps) / math.sqrt(ab_now)
+            # Clip in NORMALIZED action space (actions are z-scored to
+            # N(0,1), so ±3 covers 99.7%). Denormalization + final
+            # clip to [-1, 1] happens at inference boundary.
+            a0_pred = mx.clip(a0_pred, -3.0, 3.0)
+            a = math.sqrt(ab_next) * a0_pred + math.sqrt(1.0 - ab_next) * eps
+        return a  # caller handles denormalization + final clip
 
 
-def diffusion_loss(model: UNet1D, scheduler: NoiseScheduler,
+def diffusion_loss(model, scheduler: NoiseScheduler,
                    obs: mx.array, a0: mx.array) -> mx.array:
     B = obs.shape[0]
     T = scheduler.cfg.n_train_diffusion_steps
@@ -162,26 +179,74 @@ def diffusion_loss(model: UNet1D, scheduler: NoiseScheduler,
     return mx.mean((eps_pred - noise) ** 2)
 
 
+# ── EMA (Exponential Moving Average) ──────────────────────────
+class EMA:
+    """Fixed-decay EMA of model parameters. The EMA copy is what
+    gets evaluated and deployed — the raw model weights are noisier."""
+    def __init__(self, model: DiffusionMLP, decay: float = 0.995):
+        self.decay = decay
+        # Deep copy of all parameters
+        self.shadow = {}
+        flat = _flatten_dict(model.parameters())
+        for k, v in flat.items():
+            self.shadow[k] = mx.array(np.array(v))
+
+    def update(self, model: DiffusionMLP):
+        flat = _flatten_dict(model.parameters())
+        for k, v in flat.items():
+            self.shadow[k] = self.decay * self.shadow[k] + (1 - self.decay) * v
+
+    def apply_to(self, model: DiffusionMLP):
+        """Load EMA weights into model for inference."""
+        model.load_weights(list(self.shadow.items()))
+
+
+# ── Data normalization ────────────────────────────────────────
+class Normalizer:
+    """Zero-mean unit-variance normalization. Stores stats in the
+    checkpoint so inference uses the same normalization."""
+    def __init__(self):
+        self.obs_mean = None
+        self.obs_std = None
+        self.act_mean = None
+        self.act_std = None
+
+    def fit(self, obs: np.ndarray, act: np.ndarray):
+        self.obs_mean = obs.mean(axis=0).astype(np.float32)
+        self.obs_std = obs.std(axis=0).astype(np.float32) + 1e-6
+        self.act_mean = act.mean(axis=0).astype(np.float32)
+        self.act_std = act.std(axis=0).astype(np.float32) + 1e-6
+
+    def normalize_obs(self, obs):
+        if isinstance(obs, mx.array):
+            return (obs - mx.array(self.obs_mean)) / mx.array(self.obs_std)
+        return (obs - self.obs_mean) / self.obs_std
+
+    def normalize_act(self, act):
+        if isinstance(act, mx.array):
+            return (act - mx.array(self.act_mean)) / mx.array(self.act_std)
+        return (act - self.act_mean) / self.act_std
+
+    def denormalize_act(self, act):
+        if isinstance(act, mx.array):
+            return act * mx.array(self.act_std) + mx.array(self.act_mean)
+        return act * self.act_std + self.act_mean
+
+    def state_dict(self):
+        return {
+            "obs_mean": self.obs_mean, "obs_std": self.obs_std,
+            "act_mean": self.act_mean, "act_std": self.act_std,
+        }
+
+    def load_state_dict(self, d):
+        self.obs_mean = d["obs_mean"]
+        self.obs_std = d["obs_std"]
+        self.act_mean = d["act_mean"]
+        self.act_std = d["act_std"]
+
+
 # ── Checkpoint conversion ─────────────────────────────────────
-def convert_torch_to_mlx(torch_state: dict, cfg: DiffusionPolicyConfig) -> dict:
-    """Convert a PyTorch UNet1D state_dict to MLX parameter dict.
-
-    The main difference: PyTorch Conv1d weight is (out, in, kernel),
-    MLX Conv1d weight is (out, kernel, in). Need to transpose axes 1,2.
-    """
-    import numpy as np
-    mlx_params = {}
-    for k, v in torch_state.items():
-        arr = v.cpu().numpy()
-        # Conv1d weights: PyTorch (out, in, K) → MLX (out, K, in)
-        if "conv" in k.lower() and "weight" in k and arr.ndim == 3:
-            arr = arr.transpose(0, 2, 1)
-        mlx_params[k] = mx.array(arr)
-    return mlx_params
-
-
 def _flatten_dict(d, prefix=""):
-    """Flatten a nested dict into dot-separated keys."""
     items = {}
     for k, v in d.items():
         key = f"{prefix}.{k}" if prefix else k
@@ -199,45 +264,59 @@ def _flatten_dict(d, prefix=""):
 
 
 def convert_mlx_to_torch(mlx_params: dict) -> dict:
-    """Convert MLX parameters back to PyTorch state_dict format.
-
-    Handles the key name mapping between MLX and PyTorch architectures:
-    - MLX Conv1dBlock has .conv and .norm; PyTorch has .block.0 and .block.1
-    - MLX ResidualBlock has .cond_linear; PyTorch has .cond_mlp.1
-    - MLX UNet1D has .time_emb_l1/l2, .obs_emb_l1/l2, .out_conv;
-      PyTorch has .time_emb.1/.3, .obs_emb.0/.2, .out
-    """
+    """Convert MLX DiffusionMLP parameters to PyTorch state_dict."""
     import torch
-    import numpy as np
     flat = _flatten_dict(mlx_params)
-
-    # Build the key mapping from MLX names to PyTorch names
-    KEY_MAP = {
-        "time_emb_l1": "time_emb.1",
-        "time_emb_l2": "time_emb.3",
-        "obs_emb_l1": "obs_emb.0",
-        "obs_emb_l2": "obs_emb.2",
-        "out_conv": "out",
-        "cond_linear": "cond_mlp.1",
-    }
-    # Conv1dBlock: .conv → .block.0, .norm → .block.1
-    BLOCK_MAP = {
-        ".conv.": ".block.0.",
-        ".norm.": ".block.1.",
-    }
-
     torch_state = {}
     for k, v in flat.items():
-        tk = k
-        # Apply key mappings
-        for mlx_name, torch_name in KEY_MAP.items():
-            tk = tk.replace(mlx_name, torch_name)
-        for mlx_pat, torch_pat in BLOCK_MAP.items():
-            tk = tk.replace(mlx_pat, torch_pat)
-
         arr = np.array(v)
-        # Conv1d weight: MLX (out, K, in) → PyTorch (out, in, K)
-        if "weight" in tk and arr.ndim == 3:
-            arr = arr.transpose(0, 2, 1)
-        torch_state[tk] = torch.from_numpy(arr.copy())
+        torch_state[k] = torch.from_numpy(arr.copy())
     return torch_state
+
+
+def convert_torch_to_mlx(torch_state: dict, cfg: DiffusionPolicyConfig) -> dict:
+    """Convert PyTorch DiffusionMLP state_dict to MLX parameters."""
+    mlx_params = {}
+    for k, v in torch_state.items():
+        arr = v.cpu().numpy()
+        mlx_params[k] = mx.array(arr)
+    return mlx_params
+
+
+# ── Unified inference-time loader ─────────────────────────────
+def load_diffusion_policy(ckpt_path: str):
+    """Load a diffusion policy checkpoint and return (model, scheduler,
+    normalizer, cfg). The checkpoint must contain model weights,
+    config, and normalizer state (saved by train_bc_mlx / train_dppo_mlx).
+
+    Returns an MLX model with EMA weights already applied at save time.
+    """
+    import torch
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = DiffusionPolicyConfig(**ckpt["config"])
+    model = DiffusionMLP(cfg)
+    mlx_params = convert_torch_to_mlx(ckpt["model"], cfg)
+    model.load_weights(list(mlx_params.items()))
+    scheduler = NoiseScheduler(cfg)
+    normalizer = Normalizer()
+    if "normalizer" in ckpt:
+        normalizer.load_state_dict(ckpt["normalizer"])
+    else:
+        raise ValueError(
+            f"Checkpoint at {ckpt_path} has no 'normalizer' key. "
+            "Must be saved by train_bc_mlx / train_dppo_mlx."
+        )
+    return model, scheduler, normalizer, cfg
+
+
+def diffusion_act(model: DiffusionMLP, scheduler: NoiseScheduler,
+                  normalizer: Normalizer, obs: np.ndarray) -> np.ndarray:
+    """Sample one action chunk from the diffusion policy and return
+    the first action (denormalized)."""
+    obs_norm = normalizer.normalize_obs(obs.astype(np.float32))
+    obs_mx = mx.array(obs_norm).reshape(1, -1)
+    chunk = scheduler.ddim_sample(model, obs_mx)
+    mx.eval(chunk)
+    action_norm = np.array(chunk[0, 0])
+    action = normalizer.denormalize_act(action_norm)
+    return np.clip(action, -1.0, 1.0).astype(np.float32)

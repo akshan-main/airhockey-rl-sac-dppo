@@ -43,16 +43,21 @@ POLL_INTERVAL_SEC = int(os.environ.get("AIRHOCKEY_POLL_INTERVAL", "60"))
 
 
 class Step(BaseModel):
-    obs: list[float] = Field(..., description="10-D normalized observation")
-    action: list[float] = Field(..., description="2-D normalized action")
-    reward: float
+    obs: list[float] = Field(..., min_length=10, max_length=10,
+                             description="10-D normalized observation")
+    action: list[float] = Field(..., min_length=2, max_length=2,
+                                description="2-D normalized action")
+    reward: float = Field(..., ge=-100.0, le=100.0)
     done: bool
 
 
+MAX_TRAJECTORY_STEPS = 1000
+
+
 class Trajectory(BaseModel):
-    steps: list[Step]
-    client_id: Optional[str] = None
-    model_version: int
+    steps: list[Step] = Field(..., max_length=MAX_TRAJECTORY_STEPS)
+    client_id: Optional[str] = Field(None, max_length=64)
+    model_version: int = Field(..., ge=0)
 
 
 class VersionResponse(BaseModel):
@@ -122,16 +127,21 @@ def buffer_flush_loop() -> None:
                 if not ready:
                     continue
                 steps = [dict(s) for s in state.buffer]
-                state.buffer.clear()
+                # Don't clear yet — only clear after successful upload
             if state.store is None:
-                # No bucket configured; drop the data so memory doesn't grow.
+                with state.lock:
+                    state.buffer.clear()
                 state.last_flush = time.time()
                 continue
             key = state.store.flush_buffer(steps)
+            # Upload succeeded — now safe to clear
+            with state.lock:
+                state.buffer.clear()
             state.last_flush = time.time()
             print(f"Flushed {len(steps)} steps to {key}")
         except Exception as e:
-            print(f"flush error: {e}")
+            # Buffer is NOT cleared — data retained for next attempt
+            print(f"flush error (data retained): {e}")
 
 
 def hf_hub_poll_loop() -> None:
@@ -217,8 +227,21 @@ def model_meta():
     return FileResponse(p, media_type="application/json")
 
 
+from fastapi import Request
+from collections import defaultdict
+import time as _time
+
+_rate_limits: dict[str, float] = defaultdict(float)
+RATE_LIMIT_SECONDS = 1.0
+
+
 @app.post("/trajectory")
-def submit_trajectory(traj: Trajectory):
+def submit_trajectory(traj: Trajectory, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    now = _time.time()
+    if now - _rate_limits[client_ip] < RATE_LIMIT_SECONDS:
+        raise HTTPException(status_code=429, detail="Rate limited")
+    _rate_limits[client_ip] = now
     with state.lock:
         for s in traj.steps:
             state.buffer.append(s.model_dump())
