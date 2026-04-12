@@ -105,11 +105,14 @@ def reset_all(envs, seed):
 def step_all(envs, actions):
     next_obs, rewards, dones, infos = [], [], [], []
     for env, a in zip(envs, actions):
+        a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
+        a = np.clip(a, -1.0, 1.0)
         o, r, term, trunc, info = env.step(a)
         if term or trunc:
             o, _ = env.reset()
+        o = np.nan_to_num(o, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         next_obs.append(o)
-        rewards.append(r)
+        rewards.append(float(np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)))
         dones.append(float(term or trunc))
         infos.append(info)
     return (np.stack(next_obs).astype(np.float32),
@@ -130,7 +133,18 @@ def main(args: DPPOArgs):
 
     # No explicit KL penalty — PPO clipping + target_kl handles it
 
-    critic = Critic(obs_dim=cfg.obs_dim)
+    # Load normalizer from BC checkpoint
+    normalizer_state = torch_ckpt.get("normalizer", {})
+    from airhockey.policy_mlx import Normalizer
+    normalizer = Normalizer()
+    if not normalizer_state:
+        raise ValueError(
+            f"Checkpoint {args.init} is missing 'normalizer'; "
+            "train_bc_mlx checkpoints are required for DPPO-MLX."
+        )
+    normalizer.load_state_dict(normalizer_state)
+
+    critic = Critic(obs_dim=cfg.obs_dim * cfg.n_obs_steps)
     scheduler = NoiseScheduler(cfg)
 
     optim_actor = mopt.AdamW(learning_rate=args.actor_lr, weight_decay=1e-6)
@@ -138,6 +152,20 @@ def main(args: DPPOArgs):
 
     envs = make_envs(args.n_envs, args.seed, args.opponent)
     obs = reset_all(envs, args.seed)
+
+    # Obs history for stacking (per env)
+    n_obs = cfg.n_obs_steps
+    obs_history = [np.stack([obs[i]] * n_obs) for i in range(args.n_envs)]
+
+    def stack_obs():
+        """Stack and normalize obs for all envs → (n_envs, n_obs*obs_dim)"""
+        stacked = []
+        for i in range(args.n_envs):
+            frames = obs_history[i]  # (n_obs, obs_dim)
+            normed = normalizer.normalize_obs(frames)  # normalize each frame
+            stacked.append(normed.flatten())
+        out = np.stack(stacked).astype(np.float32)
+        return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
     H = cfg.horizon
     K = cfg.n_inference_steps
@@ -173,7 +201,8 @@ def main(args: DPPOArgs):
             need_sample = chunk_pointer == 0
             if need_sample.any():
                 idx = np.where(need_sample)[0]
-                sub_obs = mx.array(obs[idx])
+                stacked = stack_obs()
+                sub_obs = mx.array(stacked[idx])
                 res = sample_with_chain(
                     actor, scheduler, sub_obs, n_steps=K,
                     min_sampling_std=args.min_sampling_std,
@@ -208,12 +237,17 @@ def main(args: DPPOArgs):
                     pending_chain_stds[env_i] = chain_stds[j]
                     pending_chain_ab_nexts[env_i] = chain_ab_nexts[j]
                     pending_old_lp[env_i] = old_lp[j]
-                    pending_obs[env_i] = mx.array(obs[env_i])
+                    pending_obs[env_i] = mx.array(stacked[env_i])
                     chunk_reward_acc[env_i] = 0.0
                     chunk_done_acc[env_i] = 0.0
 
-            actions = current_chunks[np.arange(args.n_envs), chunk_pointer]
+            raw_actions = current_chunks[np.arange(args.n_envs), chunk_pointer]
+            # Denormalize actions from model space to env space
+            actions = normalizer.denormalize_act(raw_actions)
+            actions = np.nan_to_num(actions, nan=0.0, posinf=1.0, neginf=-1.0)
+            actions = np.clip(actions, -1.0, 1.0).astype(np.float32)
             next_obs, rewards, dones, infos = step_all(envs, actions)
+            rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
             chunk_reward_acc += rewards
             chunk_done_acc = np.maximum(chunk_done_acc, dones)
             cur_ep_return += rewards
@@ -225,11 +259,24 @@ def main(args: DPPOArgs):
                     win_window.append(1.0 if infos[i].get("event") == "goal_bot" else 0.0)
 
             obs = next_obs
+            # Update obs history for stacking
+            for i in range(args.n_envs):
+                if dones[i]:
+                    # Reset: fill history with the new reset obs
+                    obs_history[i] = np.stack([obs[i]] * n_obs)
+                else:
+                    # Shift history: drop oldest, add newest
+                    obs_history[i] = np.roll(obs_history[i], -1, axis=0)
+                    obs_history[i][-1] = obs[i]
 
             for env_i in range(args.n_envs):
                 advanced_ptr = (chunk_pointer[env_i] + 1) % H
                 if advanced_ptr == 0 or bool(dones[env_i]):
+                    if pending_obs[env_i] is None:
+                        continue
                     v = float(critic(pending_obs[env_i][None]).item())
+                    if not np.isfinite(v):
+                        v = 0.0
                     buf_obs.append(pending_obs[env_i])
                     buf_cc.append(pending_chain_curr[env_i])
                     buf_cn.append(pending_chain_next[env_i])
@@ -277,6 +324,8 @@ def main(args: DPPOArgs):
         cs_batch = mx.stack(buf_cs)
         abn_batch = mx.stack(buf_abn)
         olp_batch = mx.stack(buf_olp)
+        adv_np = np.nan_to_num(adv_np, nan=0.0, posinf=0.0, neginf=0.0)
+        ret_np = np.nan_to_num(ret_np, nan=0.0, posinf=0.0, neginf=0.0)
         adv_t = mx.array(adv_np)
         ret_t = mx.array(ret_np)
 
@@ -303,9 +352,19 @@ def main(args: DPPOArgs):
 
         avg_ret = float(np.mean(return_window)) if return_window else 0.0
         avg_win = float(np.mean(win_window)) if win_window else 0.0
+        if not np.isfinite(avg_ret):
+            avg_ret = 0.0
+        if not np.isfinite(avg_win):
+            avg_win = 0.0
+        kl = float(metrics.get("kl", 0.0))
+        clip_frac = float(metrics.get("clip_frac", 0.0))
+        if not np.isfinite(kl):
+            kl = 0.0
+        if not np.isfinite(clip_frac):
+            clip_frac = 0.0
         pbar.set_postfix(
             ret=f"{avg_ret:+.2f}", win=f"{avg_win:.2f}",
-            kl=f"{metrics['kl']:+.4f}", clip=f"{metrics['clip_frac']:.2f}",
+            kl=f"{kl:+.4f}", clip=f"{clip_frac:.2f}",
         )
 
     pbar.close()

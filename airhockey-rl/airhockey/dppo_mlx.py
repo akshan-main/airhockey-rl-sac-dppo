@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import numpy as np
 
 from airhockey.policy_mlx import DiffusionPolicyConfig, NoiseScheduler, DiffusionMLP
@@ -115,7 +116,9 @@ def per_step_logprob(
     the log-prob matches the sampling distribution exactly.
     """
     eps = model(a_curr, t_now, obs)
+    eps = mx.where(mx.isfinite(eps), eps, mx.zeros_like(eps))
     ab_now = scheduler.alpha_bars[t_now].reshape(-1, 1, 1)
+    ab_now = mx.clip(ab_now, 1e-6, 1.0)
     a0_pred = (a_curr - mx.sqrt(1.0 - ab_now) * eps) / mx.sqrt(ab_now)
     a0_pred = mx.clip(a0_pred, -1.5, 1.5)
     # Exact same mean as sample_with_chain computed
@@ -123,7 +126,9 @@ def per_step_logprob(
     # Floor std for numerical stability
     std_floored = mx.maximum(std, mx.array(min_logprob_std))
     log_prob = -0.5 * ((a_next - mean) / std_floored) ** 2 - 0.5 * mx.log(2 * np.pi * std_floored ** 2)
-    return mx.mean(log_prob, axis=(-1, -2))
+    log_prob = mx.where(mx.isfinite(log_prob), log_prob, mx.full_like(log_prob, -5.0))
+    out = mx.mean(log_prob, axis=(-1, -2))
+    return mx.where(mx.isfinite(out), out, mx.zeros_like(out))
 
 
 def compute_gae(
@@ -173,7 +178,10 @@ def dppo_update(
     target_kl: float = 1.0,
 ) -> dict[str, float]:
     B, K = chains_curr.shape[:2]
-    advantages = (advantages - mx.mean(advantages)) / (mx.std(advantages) + 1e-8)
+    advantages = mx.where(mx.isfinite(advantages), advantages, mx.zeros_like(advantages))
+    returns = mx.where(mx.isfinite(returns), returns, mx.zeros_like(returns))
+    adv_std = mx.maximum(mx.std(advantages), mx.array(1e-6))
+    advantages = (advantages - mx.mean(advantages)) / adv_std
 
     denoise_discount = mx.array(
         [gamma_denoising ** (K - k - 1) for k in range(K)]
@@ -205,18 +213,24 @@ def dppo_update(
             )
             new_lp_list.append(lp_k)
         new_lp = mx.stack(new_lp_list, axis=1)
+        new_lp = mx.where(mx.isfinite(new_lp), new_lp, mx.zeros_like(new_lp))
 
+        old_lp = mx.where(mx.isfinite(mb_old_lp), mb_old_lp, mx.zeros_like(mb_old_lp))
         new_lp_clamped = mx.clip(new_lp, -5.0, 2.0)
-        old_lp_clamped = mx.clip(mb_old_lp, -5.0, 2.0)
+        old_lp_clamped = mx.clip(old_lp, -5.0, 2.0)
 
         log_ratio = new_lp_clamped - old_lp_clamped
+        log_ratio = mx.clip(log_ratio, -20.0, 20.0)
         ratio = mx.exp(log_ratio)
+        ratio = mx.where(mx.isfinite(ratio), ratio, mx.ones_like(ratio))
 
         weighted_adv = mb_adv[:, None] * denoise_discount[None, :]
+        weighted_adv = mx.where(mx.isfinite(weighted_adv), weighted_adv, mx.zeros_like(weighted_adv))
 
         surr1 = ratio * weighted_adv
         surr2 = mx.clip(ratio, 1 - clip_coeffs[None, :], 1 + clip_coeffs[None, :]) * weighted_adv
         ppo_loss = -mx.mean(mx.minimum(surr1, surr2))
+        ppo_loss = mx.where(mx.isfinite(ppo_loss), ppo_loss, mx.array(0.0))
 
         return ppo_loss, (ratio, new_lp_clamped, old_lp_clamped)
 
@@ -246,9 +260,12 @@ def dppo_update(
             (ppo_loss, (ratio, new_clp, old_clp)), actor_grads = actor_loss_grad(
                 model, mb_obs, mb_curr, mb_next, mb_t, mb_stds, mb_ab_nexts, mb_adv, mb_old_lp
             )
+            actor_grads, _ = optim.clip_grad_norm(actor_grads, max_norm=1.0)
             optim_actor.update(model, actor_grads)
 
             c_loss, critic_grads = critic_loss_grad(critic, mb_obs, mb_ret)
+            c_loss = mx.where(mx.isfinite(c_loss), c_loss, mx.array(0.0))
+            critic_grads, _ = optim.clip_grad_norm(critic_grads, max_norm=1.0)
             optim_critic.update(critic, critic_grads)
 
             mx.eval(model.parameters(), critic.parameters(),
@@ -259,9 +276,21 @@ def dppo_update(
             clip_frac = float(mx.mean(
                 (mx.abs(ratio - 1) > clip_coeffs[None, :]).astype(mx.float32)
             ).item())
+            if not np.isfinite(approx_kl):
+                approx_kl = float("inf")
+                early_stop = True
+            if not np.isfinite(clip_frac):
+                clip_frac = 1.0
+                early_stop = True
 
-            metrics["actor_loss"] += float(ppo_loss.item())
-            metrics["critic_loss"] += float(c_loss.item())
+            actor_loss_item = float(ppo_loss.item())
+            critic_loss_item = float(c_loss.item())
+            if not np.isfinite(actor_loss_item):
+                actor_loss_item = 0.0
+            if not np.isfinite(critic_loss_item):
+                critic_loss_item = 0.0
+            metrics["actor_loss"] += actor_loss_item
+            metrics["critic_loss"] += critic_loss_item
             metrics["kl"] += approx_kl
             metrics["clip_frac"] += clip_frac
             n_updates += 1
