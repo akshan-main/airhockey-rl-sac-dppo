@@ -36,36 +36,55 @@ from airhockey.policy_mlx import (
 
 
 class ChunkDataset:
-    """Precomputes all valid (obs, action_chunk) pairs as contiguous
-    arrays. Vectorized validity check and chunk extraction — no Python
-    loops over transitions at load or sample time."""
-    def __init__(self, npz_path: str, horizon: int):
+    """Precomputes all valid (stacked_obs, action_chunk) pairs.
+
+    For each valid window starting at position i:
+      obs_window = obs[i-n_obs+1 : i+1] flattened → (n_obs * obs_dim,)
+      act_chunk  = act[i : i+horizon]              → (horizon, act_dim)
+
+    Vectorized validity + precomputed arrays. Zero Python loops at
+    load or sample time.
+    """
+    def __init__(self, npz_path: str, horizon: int, n_obs_steps: int = 2):
         d = np.load(npz_path)
         obs = d["obs"].astype(np.float32)
         act = d["act"].astype(np.float32)
         episode = d["episode"]
         timestep = d["timestep"]
         N = len(obs)
+        self.n_obs_steps = n_obs_steps
 
-        # Vectorized validity: window i is valid iff ep[i:i+H] all same
-        # AND ts[i:i+H] is contiguous.
-        # Shift arrays by H-1 positions and compare.
-        idx = np.arange(N - horizon + 1)
+        # Valid window: need n_obs_steps-1 obs before + horizon acts after.
+        # Starting position i must have:
+        #   - ep[i-n_obs+1] == ep[i+horizon-1]  (all same episode)
+        #   - ts[i+horizon-1] == ts[i] + horizon - 1  (contiguous actions)
+        #   - i >= n_obs_steps - 1  (enough history)
+        start_min = n_obs_steps - 1
+        idx = np.arange(start_min, N - horizon + 1)
         end = idx + horizon - 1
-        same_ep = episode[idx] == episode[end]
-        contiguous = timestep[end] == timestep[idx] + horizon - 1
+        hist_start = idx - (n_obs_steps - 1)
+
+        same_ep = (episode[hist_start] == episode[end])
+        contiguous = (timestep[end] == timestep[idx] + horizon - 1)
         valid_mask = same_ep & contiguous
         self.starts = idx[valid_mask].astype(np.int64)
 
-        # Precompute action chunks as a contiguous (N_valid, H, A) array.
-        # This eliminates the np.stack in the training loop.
-        self.obs = obs
-        # Use advanced indexing to build (N_valid, H, A) directly
-        chunk_idx = self.starts[:, None] + np.arange(horizon)[None, :]  # (N_valid, H)
-        self.act_chunks = act[chunk_idx]  # (N_valid, H, A)
+        # Precompute stacked obs: (N_valid, n_obs_steps * obs_dim)
+        obs_idx = self.starts[:, None] - np.arange(n_obs_steps - 1, -1, -1)[None, :]
+        # obs_idx shape: (N_valid, n_obs_steps) — indices for obs history
+        obs_windows = obs[obs_idx]  # (N_valid, n_obs_steps, obs_dim)
+        self.obs_stacked = obs_windows.reshape(len(self.starts), -1)  # (N_valid, n_obs * obs_dim)
+
+        # Precompute action chunks: (N_valid, horizon, act_dim)
+        chunk_idx = self.starts[:, None] + np.arange(horizon)[None, :]
+        self.act_chunks = act[chunk_idx]
+
+        # Keep raw obs for normalization fitting
+        self.obs_raw = obs
+        self.act_raw = act
         self.horizon = horizon
         print(f"Loaded {len(self.starts):,} windows from {N:,} transitions "
-              f"({len(self.starts) / N:.1%} valid).")
+              f"({len(self.starts) / N:.1%} valid, n_obs_steps={n_obs_steps}).")
 
     def __len__(self):
         return len(self.starts)
@@ -82,18 +101,20 @@ def train(
     val_frac: float = 0.1,
 ):
     cfg = DiffusionPolicyConfig(horizon=horizon)
-    ds = ChunkDataset(data_path, horizon=horizon)
+    ds = ChunkDataset(data_path, horizon=horizon, n_obs_steps=cfg.n_obs_steps)
 
     # ── Data normalization ────────────────────────────────────
     normalizer = Normalizer()
-    # Fit on the full obs array and the flattened action chunks
-    normalizer.fit(ds.obs, ds.act_chunks.reshape(-1, ds.act_chunks.shape[-1]))
+    normalizer.fit(ds.obs_raw, ds.act_raw)
     print(f"Normalizer: obs_mean[:3]={normalizer.obs_mean[:3]}  act_mean={normalizer.act_mean}")
 
-    # Normalize in-place (vectorized)
-    ds.obs = (ds.obs - normalizer.obs_mean) / normalizer.obs_std
+    # Normalize stacked obs: each frame in the stack gets the same norm
+    # obs_stacked is (N, n_obs * obs_dim) — normalize per-obs-dim (tiled)
+    obs_mean_tiled = np.tile(normalizer.obs_mean, cfg.n_obs_steps)
+    obs_std_tiled = np.tile(normalizer.obs_std, cfg.n_obs_steps)
+    ds.obs_stacked = (ds.obs_stacked - obs_mean_tiled) / obs_std_tiled
     ds.act_chunks = (ds.act_chunks - normalizer.act_mean) / normalizer.act_std
-    print(f"Normalized: obs range [{ds.obs.min():.2f}, {ds.obs.max():.2f}]  "
+    print(f"Normalized: obs range [{ds.obs_stacked.min():.2f}, {ds.obs_stacked.max():.2f}]  "
           f"act range [{ds.act_chunks.min():.2f}, {ds.act_chunks.max():.2f}]")
 
     # ── Val split (indices into ds.starts / ds.act_chunks) ────
@@ -158,15 +179,15 @@ def train(
 
         for step in tqdm(range(steps_per_epoch), desc=f"Epoch {epoch + 1}/{epochs}"):
             batch_idx = train_idx[step * batch_size:(step + 1) * batch_size]
-            start_positions = ds.starts[batch_idx]
-            # Vectorized batch construction — no Python loops
-            obs_batch = mx.array(ds.obs[start_positions])
+            obs_batch = mx.array(ds.obs_stacked[batch_idx])
             act_batch = mx.array(ds.act_chunks[batch_idx])
 
             # Set LR
             optimizer.learning_rate = lr_at(global_step)
 
             loss, grads = loss_and_grad(model, obs_batch, act_batch)
+            # Gradient clipping (max_norm=1.0, matching reference)
+            grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
             optimizer.update(model, grads)
             mx.eval(model.parameters(), optimizer.state)
             train_losses.append(loss.item())
@@ -182,7 +203,7 @@ def train(
         for vs in range(0, len(val_idx), batch_size):
             ve = min(vs + batch_size, len(val_idx))
             vb = val_idx[vs:ve]
-            vobs = mx.array(ds.obs[ds.starts[vb]])
+            vobs = mx.array(ds.obs_stacked[vb])
             vact = mx.array(ds.act_chunks[vb])
             vloss = diffusion_loss(model, scheduler, vobs, vact)
             mx.eval(vloss)

@@ -22,7 +22,9 @@ import numpy as np
 class DiffusionPolicyConfig:
     obs_dim: int = 10
     act_dim: int = 2
-    horizon: int = 8
+    horizon: int = 16        # predict 16 actions
+    n_action_steps: int = 8  # execute only the first 8
+    n_obs_steps: int = 2     # condition on current + previous obs
     hidden: int = 256
     n_layers: int = 3
     time_dim: int = 32
@@ -74,7 +76,7 @@ class DiffusionMLP(nn.Module):
         H, A = cfg.horizon, cfg.act_dim
         input_dim = H * A
         time_dim = cfg.time_dim
-        cond_dim = cfg.obs_dim
+        cond_dim = cfg.obs_dim * cfg.n_obs_steps  # stacked obs
         hidden = cfg.hidden
         n_layers = cfg.n_layers
 
@@ -309,12 +311,65 @@ def load_diffusion_policy(ckpt_path: str):
     return model, scheduler, normalizer, cfg
 
 
+class DiffusionInference:
+    """Stateful wrapper for inference. Maintains obs history for
+    n_obs_steps conditioning, and an action chunk buffer so we
+    only re-sample every n_action_steps steps (not every frame)."""
+
+    def __init__(self, model: DiffusionMLP, scheduler: NoiseScheduler,
+                 normalizer: Normalizer, cfg: DiffusionPolicyConfig):
+        self.model = model
+        self.scheduler = scheduler
+        self.normalizer = normalizer
+        self.cfg = cfg
+        self.obs_history: list[np.ndarray] = []
+        self.action_buffer: list[np.ndarray] = []
+        self.action_idx = 0
+
+    def reset(self):
+        self.obs_history = []
+        self.action_buffer = []
+        self.action_idx = 0
+
+    def act(self, obs: np.ndarray) -> np.ndarray:
+        obs_norm = self.normalizer.normalize_obs(obs.astype(np.float32))
+        self.obs_history.append(obs_norm)
+
+        # If we have buffered actions, use them
+        if self.action_idx < len(self.action_buffer):
+            action_norm = self.action_buffer[self.action_idx]
+            self.action_idx += 1
+            action = self.normalizer.denormalize_act(action_norm)
+            return np.clip(action, -1.0, 1.0).astype(np.float32)
+
+        # Need to sample a new chunk
+        n = self.cfg.n_obs_steps
+        # Pad history if not enough frames yet
+        while len(self.obs_history) < n:
+            self.obs_history.insert(0, self.obs_history[0])
+        # Stack last n observations
+        stacked = np.concatenate(self.obs_history[-n:])
+        obs_mx = mx.array(stacked).reshape(1, -1)
+        chunk = self.scheduler.ddim_sample(self.model, obs_mx)
+        mx.eval(chunk)
+        chunk_np = np.array(chunk[0])  # (H, A)
+        # Store first n_action_steps actions
+        self.action_buffer = [chunk_np[i] for i in range(self.cfg.n_action_steps)]
+        self.action_idx = 1  # return first, buffer rest
+        action_norm = self.action_buffer[0]
+        action = self.normalizer.denormalize_act(action_norm)
+        return np.clip(action, -1.0, 1.0).astype(np.float32)
+
+
 def diffusion_act(model: DiffusionMLP, scheduler: NoiseScheduler,
                   normalizer: Normalizer, obs: np.ndarray) -> np.ndarray:
-    """Sample one action chunk from the diffusion policy and return
-    the first action (denormalized)."""
+    """Simple single-frame action (no history, no chunk buffer).
+    For backward compatibility. Uses only the current obs repeated
+    n_obs_steps times."""
+    cfg = model.cfg
     obs_norm = normalizer.normalize_obs(obs.astype(np.float32))
-    obs_mx = mx.array(obs_norm).reshape(1, -1)
+    stacked = np.tile(obs_norm, cfg.n_obs_steps)
+    obs_mx = mx.array(stacked).reshape(1, -1)
     chunk = scheduler.ddim_sample(model, obs_mx)
     mx.eval(chunk)
     action_norm = np.array(chunk[0, 0])
