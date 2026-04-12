@@ -1,17 +1,22 @@
-"""Play against the scripted attacker locally with pygame.
+"""Play local air hockey with pygame.
 
 You control the BOTTOM paddle with your mouse (click + drag).
-The scripted attacker controls the TOP paddle.
+The TOP paddle is either scripted or SACn-driven.
 
 Usage:
     python play_local.py
+    python play_local.py --mode scripted   # scripted attacker
+    python play_local.py --mode sacn       # hybrid (scripted + SACn defensive handoff)
 """
+import argparse
 import numpy as np
 import pygame
+import torch
 
 from airhockey.env import AirHockeyEnv
 from airhockey.eval_sac import scripted_attacker
 from airhockey.physics import PhysicsConfig
+from airhockey.sac import SACAgent, SACConfig
 
 # ── Colors ───────────────────────────────────────────────────
 BG = (30, 30, 40)
@@ -28,19 +33,46 @@ FPS = 50
 
 
 def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", default="scripted", choices=["sacn", "scripted"],
+                   help="Opponent: sacn (trained agent) or scripted (hand-coded)")
+    p.add_argument("--ckpt", default="ckpt_v2/sacn_expert.best.pt",
+                   help="SACn checkpoint path")
+    args = p.parse_args()
 
-    # Higher paddle speed/accel caps than training so the human paddle
-    # feels responsive. The AI opponent uses the same caps (fair fight).
-    pc = PhysicsConfig(
-        max_paddle_speed=1400.0,   # 2x training
-        max_paddle_accel=12000.0,  # ~2.7x training
-    )
+    # Keep local play responsive for humans.
+    pc = PhysicsConfig(max_paddle_speed=1400.0, max_paddle_accel=12000.0)
     env = AirHockeyEnv(physics_config=pc, seed=42)
 
-    # The SAC policy is too passive to be a fun opponent. Use the
-    # scripted attacker as the primary opponent — it plays like a
-    # real air hockey player (charges puck, aims at goal, defends).
-    env.opponent = lambda obs_top: scripted_attacker(obs_top)
+    if args.mode == "sacn":
+        ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        cfg = SACConfig(**ckpt["config"])
+        agent = SACAgent(cfg, device="cpu")
+        agent.load_state_dict(ckpt)
+        agent.actor.eval()
+
+        def hybrid_opponent(obs_top):
+            """Scripted attacker serves and initiates. SACn defends
+            when the puck is moving toward it."""
+            puck_vy = float(obs_top[3])  # in top's mirrored frame
+            puck_speed = float(np.hypot(obs_top[2], obs_top[3]))
+            puck_y = float(obs_top[1])
+
+            # Puck is on opponent's side (y > 0.5 in mirrored frame)
+            # and moving toward them (vy > 0) — SACn defends
+            if puck_y > 0.4 and puck_vy > 0.02 and puck_speed > 0.05:
+                return agent.act(obs_top.astype(np.float32), deterministic=False)
+
+            # Otherwise scripted attacker handles serve + attack
+            return scripted_attacker(obs_top)
+
+        env.opponent = hybrid_opponent
+        title = "Air Hockey — you (blue) vs Hybrid AI (red)"
+        opp_name = "Hybrid"
+    else:
+        env.opponent = scripted_attacker
+        title = "Air Hockey — you (blue) vs Scripted (red)"
+        opp_name = "Scripted"
 
 
     # ── Pygame setup ─────────────────────────────────────────
@@ -50,7 +82,7 @@ def main():
 
     pygame.init()
     screen = pygame.display.set_mode((SW, SH))
-    pygame.display.set_caption("Air Hockey — you (blue) vs SAC (red)")
+    pygame.display.set_caption(title)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 20)
 
@@ -165,9 +197,7 @@ def main():
         )
 
         # Score
-        score_txt = font.render(
-            f"You (blue) {bot_score}  -  {top_score} SAC (red)", True, TEXT
-        )
+        score_txt = font.render(f"You (blue) {bot_score}  -  {top_score} {opp_name} (red)", True, TEXT)
         screen.blit(score_txt, (SW // 2 - score_txt.get_width() // 2, 5))
 
         pygame.display.flip()

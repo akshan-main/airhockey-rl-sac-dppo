@@ -123,9 +123,18 @@ def step_all(envs, actions):
 def main(args: DPPOArgs):
     mx.random.seed(args.seed)
     np.random.seed(args.seed)
+    repo_root = Path(__file__).resolve().parents[1]
+
+    def resolve_repo_path(p: str) -> Path:
+        q = Path(p)
+        return q if q.is_absolute() else (repo_root / q)
+
+    init_path = resolve_repo_path(args.init)
+    opponent_path = resolve_repo_path(args.opponent)
+    out_path = resolve_repo_path(args.out)
 
     # Load BC checkpoint into MLX
-    torch_ckpt = torch.load(args.init, map_location="cpu", weights_only=False)
+    torch_ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
     cfg = DiffusionPolicyConfig(**torch_ckpt["config"])
     actor = DiffusionMLP(cfg)
     mlx_params = convert_torch_to_mlx(torch_ckpt["model"], cfg)
@@ -139,7 +148,7 @@ def main(args: DPPOArgs):
     normalizer = Normalizer()
     if not normalizer_state:
         raise ValueError(
-            f"Checkpoint {args.init} is missing 'normalizer'; "
+            f"Checkpoint {init_path} is missing 'normalizer'; "
             "train_bc_mlx checkpoints are required for DPPO-MLX."
         )
     normalizer.load_state_dict(normalizer_state)
@@ -150,7 +159,7 @@ def main(args: DPPOArgs):
     optim_actor = mopt.AdamW(learning_rate=args.actor_lr, weight_decay=1e-6)
     optim_critic = mopt.AdamW(learning_rate=args.critic_lr, weight_decay=1e-6)
 
-    envs = make_envs(args.n_envs, args.seed, args.opponent)
+    envs = make_envs(args.n_envs, args.seed, str(opponent_path))
     obs = reset_all(envs, args.seed)
 
     # Obs history for stacking (per env)
@@ -370,18 +379,17 @@ def main(args: DPPOArgs):
     pbar.close()
 
     # Save as PyTorch for ONNX compatibility
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     torch_state = convert_mlx_to_torch(actor.parameters())
     # Load normalizer from the BC checkpoint so DPPO output is self-contained
-    bc_ckpt = torch.load(args.init, map_location="cpu", weights_only=False)
+    bc_ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
     normalizer_state = bc_ckpt.get("normalizer", {})
     torch.save(
         {"model": torch_state, "config": cfg.__dict__,
          "normalizer": normalizer_state},
-        out,
+        out_path,
     )
-    print(f"Saved DPPO checkpoint to {out}")
+    print(f"Saved DPPO checkpoint to {out_path}")
 
 
 def parse_args() -> DPPOArgs:

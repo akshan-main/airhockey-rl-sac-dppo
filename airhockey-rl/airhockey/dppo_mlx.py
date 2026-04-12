@@ -126,9 +126,9 @@ def per_step_logprob(
     # Floor std for numerical stability
     std_floored = mx.maximum(std, mx.array(min_logprob_std))
     log_prob = -0.5 * ((a_next - mean) / std_floored) ** 2 - 0.5 * mx.log(2 * np.pi * std_floored ** 2)
-    log_prob = mx.where(mx.isfinite(log_prob), log_prob, mx.full_like(log_prob, -5.0))
+    log_prob = mx.where(mx.isfinite(log_prob), log_prob, mx.full(log_prob.shape, -5.0))
     out = mx.mean(log_prob, axis=(-1, -2))
-    return mx.where(mx.isfinite(out), out, mx.zeros_like(out))
+    return mx.where(mx.isfinite(out), out, mx.zeros(out.shape))
 
 
 def compute_gae(
